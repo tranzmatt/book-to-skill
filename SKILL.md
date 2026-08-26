@@ -42,8 +42,8 @@ Four paths available. Route based on what the user asks:
 
 ### 1. Full Conversion (Default)
 **Trigger:** User provides one or more document/directory/glob paths without special instructions
-**Action:** Run all steps below (Steps 0–9)
-**Output:** Complete skill with SKILL.md, chapters/, glossary, patterns, cheatsheet
+**Action:** Run all steps below (Steps 0–9, plus 8.5 when the source has repeated-structure reference data — see Step 1.5)
+**Output:** Complete skill with SKILL.md, chapters/, glossary, patterns, cheatsheet, and reference.md when applicable
 
 ### 2. Analyze Only
 **Trigger:** User says "analyze", "just extract", or "I want to review before generating"
@@ -116,7 +116,15 @@ Store the answer as `BOOK_TYPE`:
 - Option 2 → `BOOK_TYPE=text`
 - Option 3 → `BOOK_TYPE=text`
 
-**If `BOOK_TYPE=technical`**, inform the user before proceeding:
+**If `BOOK_TYPE=technical`**, ask one follow-up before proceeding:
+
+> "One more thing — does this book contain **large sets of repeated-structure reference entries**? For example: character/monster stat blocks, weapon or price catalogs, spell/item lists, legal code sections, recipe databases — the kind of content where the same fields repeat dozens of times with different values.
+>
+> If yes, I'll generate a dedicated `reference.md` with *every* entry as complete structured data, alongside the normal chapter summaries (which sample a few representative examples rather than reproducing all of them — that's deliberate, to keep chapters lean)."
+
+Store the answer as `HAS_REFERENCE_TABLES` (true/false). Default to false on an ambiguous or missing answer — Step 8.5 is purely additive and only runs when this is explicitly true, so getting it wrong in the false direction just means the user can ask for it afterward.
+
+Then inform the user before proceeding:
 > "📐 Technical mode selected — using Docling for structure-aware extraction (tables, code blocks, formulas preserved as markdown). This takes ~1.5s per page, so expect a few minutes for longer sources. Starting now…"
 
 **If `BOOK_TYPE=text`**, inform:
@@ -204,8 +212,9 @@ Read this run's `metadata.json` (the `Meta ->` path from the extraction output) 
 
 **How to estimate:**
 - Input tokens ≈ `estimated_tokens` from metadata × 1.3 (prompts overhead per chapter pass)
-- Output tokens ≈ chapters × per-chapter budget + 4,000 (SKILL.md) + 4,500 (glossary + patterns + cheatsheet)
+- Output tokens ≈ chapters × per-chapter budget + 4,000 (SKILL.md) + 4,500 (glossary + patterns + cheatsheet) + reference.md if `HAS_REFERENCE_TABLES`
   - Per-chapter budget midpoint by `BOOK_TYPE` (DEPTH is decided later in Step 4 and can raise it): `text` ≈ 1,000, `technical` ≈ 1,800. If the user has already indicated reference-only vs deep study, use the matching row of the Step 7 matrix.
+  - reference.md (Step 8.5), if applicable: unlike chapters, this isn't sampled — budget roughly entry count × 60–150 tokens (a compact table row, not prose), and say so explicitly in the estimate so the user isn't surprised a 24-entry catalog costs more than a typical chapter.
 - Cost: report the token counts and multiply by the user's current per-1M-token input/output rates. Do NOT hardcode dollar figures — model names and prices change; if you show one, label it an estimate and date it.
 
 Wait for the user to confirm before proceeding. If they say "analyze only", switch to Mode 2.
@@ -454,6 +463,92 @@ Avoid: bare term→definition rows (that's the glossary), and prose paragraphs (
 
 ---
 
+## Step 8.5 — Generate reference.md (reference-dense books only)
+
+**Skip this step entirely unless `HAS_REFERENCE_TABLES=true`** (set in Step 1.5).
+
+Chapter summaries (Step 7) deliberately sample rather than reproduce repeated-structure
+data — Quality Rule 3 ("density over completeness") is about compressing prose, not about
+dropping most of a reference table's rows. A skill that kept only 3 of a book's 24
+character templates, or 2 of its 40 recipes, isn't dense — it's missing the exact numbers
+a practitioner will go looking for later. `reference.md` is the fix: a data-only companion
+file with *every* entry of the repeated structure, none dropped.
+
+### 1. Identify the repeated-structure section(s)
+
+Find the section(s) of `full_text.txt` (or the source's own ToC) where the same field
+pattern repeats many times — a heading, then a fixed set of labeled fields, repeated per
+entry (e.g. "NAME → attribute table → equipment → notes", repeated 24 times). `grep -c` a
+representative recurring label to estimate the entry count before committing to a full
+pass. A book may have more than one such structure (e.g. characters *and* a separate
+weapons catalog) — handle each independently.
+
+### 2. Get a clean, layout-preserving extraction of just that range
+
+Do not reuse Step 2's naive/fast extraction chain (`pdftotext`, `pypdf`, `pdfminer`) for
+this pass if the source has a multi-column layout — plain text extraction interleaves
+columns on this kind of page (an entry's Equipment line can end up mid-paragraph inside
+the *next* entry's Background). Docling's layout-aware mode gets the reading order right;
+this is exactly what `BOOK_TYPE=technical` chose Docling for in the first place.
+
+For a large book, do not reprocess the whole thing just for this section — slice out only
+the relevant page range first, so this pass stays fast (seconds to a few minutes, not the
+full book's runtime):
+
+```bash
+# Find the page range once (pdftotext page markers or a ToC lookup), then slice it out:
+gs -sDEVICE=pdfwrite -dNOPAUSE -dBATCH -dFirstPage=<start> -dLastPage=<end> \
+  -sOutputFile="$WORKDIR/reference_slice.pdf" "<source.pdf>"
+
+CUDA_VISIBLE_DEVICES="" "$PYTHON_BIN" "$SCRIPT_PATH" \
+  "$WORKDIR/reference_slice.pdf" --mode technical --install-missing yes
+```
+
+(`CUDA_VISIBLE_DEVICES=""` sidesteps a GPU/cuDNN version mismatch some environments hit
+with Docling's layout model — safe to always include for this slice pass, since it only
+forces CPU for a small page range. If `gs`/Ghostscript isn't available, `pypdf`'s
+`PdfWriter` page-range API is an equivalent fallback — either just needs to produce a
+small, valid PDF of the target pages.)
+
+Read the resulting `full_text.txt` for this slice directly — it's small enough that the
+Step 2.6 grep/sed discipline isn't necessary here.
+
+### 3. Extract every entry as compact structured rows
+
+For each repeated entry, pull only the data fields into one or more markdown tables —
+numbers, short tags, item names. Leave narrative prose (background story, personality,
+flavor quotes) out of `reference.md` entirely; that stays in Step 7's chapter treatment as
+sampled worked examples, not duplicated here. One row per entry, one table per distinct
+field-set shape.
+
+Cross-check a handful of entries against the source before finalizing: this step exists
+specifically because exact numbers matter here, so a wrong stat or price defeats the point.
+
+### 4. Write `$SKILLS_HOME/<skill_name>/reference.md`
+
+```markdown
+# Reference: <Section Name> (Full Data)
+
+<1-2 sentences: what this covers and why it's separate from the chapter summary — link to
+the chapter that has the narrative/framework treatment of the same section>
+
+## <Table Name>
+
+| <Entry> | <field> | <field> | ... |
+|---|---|---|---|
+...
+
+## Source Note
+Extracted via a layout-aware (Docling technical mode) pass on just this section's page
+range, to preserve column/table structure. Cross-verified against Ch <N>'s sampled entries.
+```
+
+No fixed token budget here — this file is complete data, not a synthesized summary, so its
+size legitimately scales with entry count. It stays cheap in practice regardless: compact
+rows, no prose.
+
+---
+
 ## Step 9 — Generate the master SKILL.md
 
 **CRITICAL TOKEN BUDGET: Keep SKILL.md body under 4,000 tokens.**
@@ -512,6 +607,8 @@ the relevant chapter file before answering.
 - [glossary.md](glossary.md) — all key terms with definitions
 - [patterns.md](patterns.md) — all techniques and design patterns
 - [cheatsheet.md](cheatsheet.md) — quick reference tables and decision guides
+<!-- Only include the next line if HAS_REFERENCE_TABLES=true (Step 8.5 ran) -->
+- [reference.md](reference.md) — complete <section name> data (every entry, not sampled — see chapters for the narrative treatment of the same material)
 
 ---
 
@@ -589,6 +686,7 @@ Files generated:
   glossary.md      — key terms                 (~X tokens)
   patterns.md      — techniques & patterns     (~X tokens)
   cheatsheet.md    — quick reference           (~X tokens)
+  reference.md     — complete <section> data   (~X tokens)   [only if HAS_REFERENCE_TABLES]
   ─────────────────────────────────────────────────────
   Total skill size: ~X tokens (loaded on-demand, not all at once)
 
@@ -699,6 +797,10 @@ For each new or revised chapter:
   - Read existing `$SKILLS_HOME/<skill_name>/cheatsheet.md`.
   - Extract new comparison rules, decision tables, or parameter guides.
   - Integrate them cleanly into the cheatsheet structure.
+- **Merge reference.md** (only relevant if the new content has repeated-structure data — see Step 8.5):
+  - If `$SKILLS_HOME/<skill_name>/reference.md` already exists and the new source extends the *same* repeated structure (e.g. an expansion book adding more entries to an existing catalog), append the new entries as additional rows in the existing table(s) rather than creating a duplicate file.
+  - If the new source introduces a *different* repeated structure, add a new table section to the existing file rather than merging rows into an unrelated table.
+  - If no `reference.md` exists yet but the new content qualifies, run Step 8.5 fresh to create it.
 
 ### 5. Re-generate the Master SKILL.md
 Update the master skill file `$SKILLS_HOME/<skill_name>/SKILL.md`:
@@ -722,3 +824,4 @@ Once the files are successfully written and merged, run **Step 9.5**, then proce
 6. **Chapter files are on-demand** — they don't count against skill budget until loaded
 7. **Never copy raw book text** — always synthesize, summarize, extract signal
 8. **Topic index is critical** — it's how the agent navigates to the right chapter file
+9. **Rule 3 (density over completeness) governs prose, not repeated-structure data** — a chapter should sample and synthesize, but a book's reference tables (stat blocks, price lists, catalogs) belong complete in `reference.md` when `HAS_REFERENCE_TABLES=true` (Step 8.5); dropping most of a repeated table isn't density, it's a missing lookup a practitioner will hit later
