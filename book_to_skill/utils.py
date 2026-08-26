@@ -778,9 +778,10 @@ def extract_single_file(input_path: Path, extraction_mode: str, install_mode: st
             )
         if extraction_mode == "technical":
             print("Mode: technical — using Docling (layout-aware)...", end=" ", flush=True)
-            text = extract_with_docling(input_str)
+            docling_info: dict = {}
+            text = extract_with_docling(input_str, _info=docling_info)
             if text and text.strip():
-                method = "docling"
+                method = "docling+ocr" if docling_info.get("used_ocr") else "docling"
                 print("OK")
             else:
                 print("not available, falling back to pdftotext")
