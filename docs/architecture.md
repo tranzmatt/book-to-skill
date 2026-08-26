@@ -91,8 +91,15 @@ is layered:
 - **DOCX XXE / Billion-Laughs guard** (`parsers/docx.py`) — rejects any XML part
   declaring a DTD or entities before parsing.
 - **Subprocess argument-injection** — file paths are absolutised before reaching
-  `pdftotext` / `pdfinfo` / `ebook-convert`, so a `-`-leading filename can't be read
-  as a flag.
+  `pdftotext` / `pdfinfo` / `ebook-convert` / `pdftoppm` / `tesseract`, so a
+  `-`-leading filename can't be read as a flag.
+- **`BOOK_SKILL_OCR_CMD` trust boundary** — the OCR fallback chain in
+  `parsers/pdf.py` (`extract_with_docling`) runs an operator-set environment
+  variable as a command when a PDF's text yield is too sparse to be real body
+  text. This is config the user sets themselves, not content parsed from the
+  document, so it's outside the untrusted-document threat model above (same
+  trust level as any other env var/CLI flag) -- it must never be populated
+  from document-derived text.
 - **Generated-skill scan** (`tools/scan_generated_skill.py`) — an advisory step in
   the generator (Step 9.5) that flags instruction-override phrases, model-control
   tags, residual invisible Unicode, authority-widening frontmatter, and

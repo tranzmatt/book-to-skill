@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
+from pathlib import Path
 
 # A bare page number sitting alone on a line: Arabic, or a Roman numeral of the
 # kind used to number front matter.
@@ -142,8 +145,118 @@ def extract_with_pdfminer(pdf_path: str) -> str | None:
         return None
 
 
-def extract_with_docling(pdf_path: str) -> str | None:
-    """Layout-aware extraction using Docling. Best for technical books with tables and code."""
+# A real body-text page runs to hundreds of words. A page-image PDF with a thin
+# text layer -- e.g. a print-vendor order watermark stamped on every page --
+# still "has text" (so the fast `looks_image_only` pre-check on page 1-5 lets it
+# through) but yields only a handful of words per page. Set well above what a
+# stray watermark/running-header produces, and well below genuine prose, so a
+# legitimately sparse page (a title page, a table-only appendix page) doesn't
+# false-positive into a slow OCR fallback.
+_MIN_WORDS_PER_PAGE = 20
+
+
+def _words_per_page(text: str | None, pdf_path: str) -> float:
+    """`inf` when the page count can't be determined -- callers treat that as
+    "not low yield" rather than guessing, matching the previous behavior of
+    only judging density when `count_pages` actually returned something."""
+    if not text:
+        return 0.0
+    pages = count_pages(pdf_path)
+    return (len(text.split()) / pages) if pages else float("inf")
+
+
+def _is_low_yield(text: str | None, pdf_path: str) -> bool:
+    return _words_per_page(text, pdf_path) < _MIN_WORDS_PER_PAGE
+
+
+def _ocr_via_external_command(pdf_path: str) -> str | None:
+    """Highest-quality, opt-in OCR tier: shells out to a user-configured
+    command for the whole PDF, e.g. a wrapper script around a locally-cached
+    HF vision-language OCR model (DeepSeek-OCR, GOT-OCR2, etc).
+
+    book-to-skill's own runtime deliberately stays free of GPU/ML
+    dependencies -- torch/transformers and multi-GB model weights aren't
+    something every user of this tool wants installed just to handle the
+    rare scanned PDF. `BOOK_SKILL_OCR_CMD` is the extension point: set it to
+    a command that accepts an absolute PDF path as its final argument and
+    prints extracted markdown/text to stdout. Not set -> this tier is a no-op
+    and the chain falls through to Docling's built-in OCR, then Tesseract.
+    """
+    cmd = os.environ.get("BOOK_SKILL_OCR_CMD")
+    if not cmd:
+        return None
+    try:
+        result = subprocess.run(
+            [*shlex.split(cmd), os.path.abspath(pdf_path)],
+            capture_output=True, text=True, timeout=1800,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout
+        print(
+            f"  [warn] BOOK_SKILL_OCR_CMD exited {result.returncode}: "
+            f"{result.stderr.strip()[:400]}",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(f"  [warn] BOOK_SKILL_OCR_CMD failed: {type(e).__name__}: {e}", file=sys.stderr)
+    return None
+
+
+def _ocr_via_tesseract(pdf_path: str) -> str | None:
+    """Universal last-resort OCR tier: CPU-only, needs nothing beyond the
+    `tesseract` and `pdftoppm` binaries most Linux systems already carry.
+    Slow (whole seconds per page) and lower quality than a VLM OCR model, but
+    always available -- the floor every other tier falls back to."""
+    if not (shutil.which("tesseract") and shutil.which("pdftoppm")):
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            subprocess.run(
+                ["pdftoppm", "-jpeg", "-r", "200", os.path.abspath(pdf_path), os.path.join(tmp, "page")],
+                capture_output=True, timeout=300, check=True,
+            )
+        except Exception as e:
+            print(f"  [warn] pdftoppm failed during tesseract OCR: {type(e).__name__}: {e}", file=sys.stderr)
+            return None
+        pages_text = []
+        for page_img in sorted(Path(tmp).glob("page-*.jpg")):
+            try:
+                result = subprocess.run(
+                    ["tesseract", str(page_img), "stdout"],
+                    capture_output=True, text=True, timeout=120,
+                    encoding="utf-8", errors="replace",
+                )
+                pages_text.append(result.stdout if result.returncode == 0 else "")
+            except Exception as e:
+                print(f"  [warn] tesseract failed on {page_img.name}: {type(e).__name__}: {e}", file=sys.stderr)
+                pages_text.append("")
+    if not pages_text:
+        return None
+    text = "\f".join(pages_text)
+    return clean_pdftotext(text) if text.strip() else None
+
+
+def extract_with_docling(
+    pdf_path: str, force_ocr: bool = False, _info: dict | None = None
+) -> str | None:
+    """Layout-aware extraction using Docling. Best for technical books with tables and code.
+
+    When `force_ocr` is False and the converted text is too sparse to be real
+    body text (see `_MIN_WORDS_PER_PAGE`) -- the signature of a page-image PDF
+    whose only native text is a thin overlay (watermark, stamped order
+    number) that `looks_image_only`'s page 1-5 probe wasn't enough to catch --
+    walks a quality-descending OCR tier chain, stopping at the first tier
+    that clears the density bar: a user-configured external command
+    (`BOOK_SKILL_OCR_CMD`, e.g. a local DeepSeek-OCR setup), then Docling's
+    own built-in OCR pipeline, then Tesseract as the CPU-only universal
+    fallback.
+
+    `_info`, if given, is filled in with `{"used_ocr": True, "ocr_backend":
+    <tier name>}` once some tier's output is actually returned -- purely
+    additive bookkeeping for the caller (e.g. to label `extraction_method`
+    in metadata); callers that don't pass it see no change in behavior.
+    """
     try:
         from docling.document_converter import DocumentConverter
         from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -151,7 +264,7 @@ def extract_with_docling(pdf_path: str) -> str | None:
         from docling.document_converter import PdfFormatOption
 
         pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = False
+        pipeline_options.do_ocr = force_ocr
         pipeline_options.do_table_structure = True
 
         converter = DocumentConverter(
@@ -160,12 +273,41 @@ def extract_with_docling(pdf_path: str) -> str | None:
             }
         )
         result = converter.convert(pdf_path)
-        return result.document.export_to_markdown()
+        text = result.document.export_to_markdown()
     except ImportError:
         return None
     except Exception as e:
         print(f"  [warn] extract_with_docling failed: {type(e).__name__}: {e}", file=sys.stderr)
         return None
+
+    if force_ocr or not _is_low_yield(text, pdf_path):
+        return text
+
+    print(
+        f"  [warn] docling extracted only ~{_words_per_page(text, pdf_path):.1f} words/page "
+        "-- this usually means the PDF is page-images with little or no real text layer; "
+        "trying OCR fallbacks (external command -> docling -> tesseract)",
+        file=sys.stderr,
+    )
+    best_text, best_backend = text, None
+    tiers = (
+        ("external", lambda: _ocr_via_external_command(pdf_path)),
+        ("docling", lambda: extract_with_docling(pdf_path, force_ocr=True)),
+        ("tesseract", lambda: _ocr_via_tesseract(pdf_path)),
+    )
+    for tier_name, run in tiers:
+        candidate = run()
+        if not candidate or not candidate.strip():
+            continue
+        if len(candidate.split()) > len((best_text or "").split()):
+            best_text, best_backend = candidate, tier_name
+        if not _is_low_yield(candidate, pdf_path):
+            break  # good enough -- stop climbing the tier chain
+
+    if best_backend is not None and _info is not None:
+        _info["used_ocr"] = True
+        _info["ocr_backend"] = best_backend
+    return best_text
 
 
 def count_pages(pdf_path: str) -> int:

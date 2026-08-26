@@ -1867,6 +1867,329 @@ class TestLooksImageOnly:
         assert "ocrmypdf" in str(exc.value)
 
 
+class TestDoclingOcrFallback:
+    """A page-image PDF with only a thin text layer (e.g. a print-vendor
+    watermark stamped on every page) still has *some* extractable text, so
+    `looks_image_only`'s page 1-5 probe lets it through. `extract_with_docling`
+    is the second line of defense: it must notice the low words-per-page yield
+    and walk a quality-descending OCR tier chain (external command -> Docling's
+    own OCR -> Tesseract), stopping at the first tier that clears the bar.
+
+    Every test neutralizes the external-command and Tesseract tiers by
+    monkeypatching `_ocr_via_external_command` / `_ocr_via_tesseract` directly
+    -- never through real subprocesses or env vars -- so these stay
+    deterministic and don't depend on what's installed on the machine running
+    the suite.
+    """
+
+    class _FakePipelineOptions:
+        def __init__(self):
+            self.do_ocr = None
+            self.do_table_structure = None
+
+    class _FakeInputFormat:
+        PDF = "pdf"
+
+    @staticmethod
+    def _install_fake_docling(monkeypatch, text_by_ocr_flag):
+        """`text_by_ocr_flag` maps do_ocr (bool) -> markdown text to return."""
+        import types
+
+        calls = []
+
+        class _FakeDocument:
+            def __init__(self, text):
+                self._text = text
+
+            def export_to_markdown(self):
+                return self._text
+
+        class _FakeConvertResult:
+            def __init__(self, text):
+                self.document = _FakeDocument(text)
+
+        class _FakePdfFormatOption:
+            def __init__(self, pipeline_options=None):
+                self.pipeline_options = pipeline_options
+
+        class _FakeConverter:
+            def __init__(self, format_options=None):
+                self.format_options = format_options
+
+            def convert(self, pdf_path):
+                opt = self.format_options[TestDoclingOcrFallback._FakeInputFormat.PDF]
+                used_ocr = bool(opt.pipeline_options.do_ocr)
+                calls.append(used_ocr)
+                return _FakeConvertResult(text_by_ocr_flag[used_ocr])
+
+        docling_mod = types.ModuleType("docling")
+        document_converter_mod = types.ModuleType("docling.document_converter")
+        document_converter_mod.DocumentConverter = _FakeConverter
+        document_converter_mod.PdfFormatOption = _FakePdfFormatOption
+        datamodel_mod = types.ModuleType("docling.datamodel")
+        pipeline_options_mod = types.ModuleType("docling.datamodel.pipeline_options")
+        pipeline_options_mod.PdfPipelineOptions = TestDoclingOcrFallback._FakePipelineOptions
+        base_models_mod = types.ModuleType("docling.datamodel.base_models")
+        base_models_mod.InputFormat = TestDoclingOcrFallback._FakeInputFormat
+
+        monkeypatch.setitem(sys.modules, "docling", docling_mod)
+        monkeypatch.setitem(sys.modules, "docling.document_converter", document_converter_mod)
+        monkeypatch.setitem(sys.modules, "docling.datamodel", datamodel_mod)
+        monkeypatch.setitem(sys.modules, "docling.datamodel.pipeline_options", pipeline_options_mod)
+        monkeypatch.setitem(sys.modules, "docling.datamodel.base_models", base_models_mod)
+        return calls
+
+    @pytest.fixture(autouse=True)
+    def _no_external_or_tesseract_tier_by_default(self, monkeypatch):
+        """Every test starts with the external-command and Tesseract tiers as
+        no-ops; individual tests override one to make it "win" a case."""
+        monkeypatch.setattr(pdf_parser, "_ocr_via_external_command", lambda pdf_path: None)
+        monkeypatch.setattr(pdf_parser, "_ocr_via_tesseract", lambda pdf_path: None)
+
+    def test_sparse_watermark_only_text_falls_through_to_docling_tier(self, monkeypatch):
+        # 4 pages, ~4 words/page without OCR (a watermark) vs real prose with it.
+        # External tier is a no-op (autouse fixture), so Docling's own OCR wins.
+        sparse = "Valued Customer\n" * 4
+        real = " ".join(["word"] * 30 * 4)
+        calls = self._install_fake_docling(monkeypatch, {False: sparse, True: real})
+        monkeypatch.setattr(pdf_parser, "count_pages", lambda path: 4)
+
+        info: dict = {}
+        result = pdf_parser.extract_with_docling("scan.pdf", _info=info)
+
+        assert result == real
+        assert calls == [False, True]  # plain pass first, then OCR retry
+        assert info == {"used_ocr": True, "ocr_backend": "docling"}
+
+    def test_dense_text_does_not_trigger_any_ocr_tier(self, monkeypatch):
+        real = " ".join(["word"] * 30 * 4)
+        calls = self._install_fake_docling(monkeypatch, {False: real, True: "unused"})
+        monkeypatch.setattr(pdf_parser, "count_pages", lambda path: 4)
+
+        info: dict = {}
+        result = pdf_parser.extract_with_docling("book.pdf", _info=info)
+
+        assert result == real
+        assert calls == [False]  # no retry -- yield was healthy
+        assert info == {}
+
+    def test_external_command_tier_wins_before_docling_is_even_tried(self, monkeypatch):
+        """The highest-quality, opt-in tier (e.g. a local DeepSeek-OCR setup
+        via BOOK_SKILL_OCR_CMD) should preempt Docling's own OCR entirely when
+        it already clears the density bar -- no reason to pay for a second,
+        lower-quality OCR pass."""
+        sparse = "Valued Customer\n" * 4
+        external_text = " ".join(["word"] * 30 * 4)
+        calls = self._install_fake_docling(monkeypatch, {False: sparse})  # no True entry needed
+        monkeypatch.setattr(pdf_parser, "count_pages", lambda path: 4)
+        monkeypatch.setattr(
+            pdf_parser, "_ocr_via_external_command", lambda pdf_path: external_text
+        )
+
+        info: dict = {}
+        result = pdf_parser.extract_with_docling("scan.pdf", _info=info)
+
+        assert result == external_text
+        assert calls == [False]  # docling's own OCR pass never ran
+        assert info == {"used_ocr": True, "ocr_backend": "external"}
+
+    def test_tesseract_tier_wins_when_external_and_docling_both_fall_short(self, monkeypatch):
+        sparse = "Valued Customer\n" * 4
+        docling_ocr_text = "Valued Customer\n" * 4  # docling's OCR pass doesn't help either
+        tesseract_text = " ".join(["word"] * 30 * 4)
+        calls = self._install_fake_docling(
+            monkeypatch, {False: sparse, True: docling_ocr_text}
+        )
+        monkeypatch.setattr(pdf_parser, "count_pages", lambda path: 4)
+        monkeypatch.setattr(
+            pdf_parser, "_ocr_via_tesseract", lambda pdf_path: tesseract_text
+        )
+
+        info: dict = {}
+        result = pdf_parser.extract_with_docling("scan.pdf", _info=info)
+
+        assert result == tesseract_text
+        assert calls == [False, True]
+        assert info == {"used_ocr": True, "ocr_backend": "tesseract"}
+
+    def test_all_tiers_sparse_falls_back_to_best_available_without_claiming_success(
+        self, monkeypatch
+    ):
+        # Genuinely unreadable scan: nothing clears the bar. Must not report
+        # used_ocr=True for a result that was never actually an improvement.
+        sparse = "Valued Customer\n" * 4  # 4 words
+        still_sparse = "Valued Customer\n" * 4  # tie, doesn't count as "better"
+        calls = self._install_fake_docling(
+            monkeypatch, {False: sparse, True: still_sparse}
+        )
+        monkeypatch.setattr(pdf_parser, "count_pages", lambda path: 4)
+
+        info: dict = {}
+        result = pdf_parser.extract_with_docling("scan.pdf", _info=info)
+
+        assert result == sparse
+        assert calls == [False, True]
+        assert info == {}
+
+    def test_all_tiers_sparse_but_one_tier_still_improves_is_reported(self, monkeypatch):
+        """Even when no tier clears the density bar outright, a tier that
+        genuinely produced more text than the original sparse pass is a real
+        improvement and should be surfaced, not silently discarded."""
+        sparse = "Valued Customer\n" * 4  # 4 words
+        docling_ocr_text = "Valued Customer\n" * 4  # 4 words, no improvement
+        tesseract_text = "Valued Customer number order stamp\n" * 4  # 20 words, more but still under the bar
+        calls = self._install_fake_docling(
+            monkeypatch, {False: sparse, True: docling_ocr_text}
+        )
+        monkeypatch.setattr(pdf_parser, "count_pages", lambda path: 4)
+        monkeypatch.setattr(
+            pdf_parser, "_ocr_via_tesseract", lambda pdf_path: tesseract_text
+        )
+
+        info: dict = {}
+        result = pdf_parser.extract_with_docling("scan.pdf", _info=info)
+
+        assert result == tesseract_text
+        assert calls == [False, True]
+        assert info == {"used_ocr": True, "ocr_backend": "tesseract"}
+
+    def test_force_ocr_true_skips_tier_chain_entirely(self, monkeypatch):
+        # Called with force_ocr=True (the recursive/explicit case): even sparse
+        # output must not recurse into the tier chain again.
+        sparse = "Valued Customer\n" * 4
+        calls = self._install_fake_docling(monkeypatch, {True: sparse})
+        monkeypatch.setattr(pdf_parser, "count_pages", lambda path: 4)
+
+        result = pdf_parser.extract_with_docling("scan.pdf", force_ocr=True)
+
+        assert result == sparse
+        assert calls == [True]
+
+    def test_info_param_is_fully_optional(self, monkeypatch):
+        """Callers that don't pass `_info` (e.g. any external code still on the
+        old signature) see identical behavior -- just no bookkeeping dict."""
+        sparse = "Valued Customer\n" * 4
+        real = " ".join(["word"] * 30 * 4)
+        self._install_fake_docling(monkeypatch, {False: sparse, True: real})
+        monkeypatch.setattr(pdf_parser, "count_pages", lambda path: 4)
+
+        result = pdf_parser.extract_with_docling("scan.pdf")
+
+        assert result == real
+
+
+class TestOcrViaExternalCommand:
+    """`_ocr_via_external_command` is the opt-in extension point
+    (`BOOK_SKILL_OCR_CMD`) letting a user point book-to-skill at their own
+    heavier OCR setup (e.g. a local DeepSeek-OCR venv) without book-to-skill
+    itself carrying any GPU/ML runtime dependency."""
+
+    def test_unset_env_var_is_a_no_op(self, monkeypatch):
+        monkeypatch.delenv("BOOK_SKILL_OCR_CMD", raising=False)
+        assert pdf_parser._ocr_via_external_command("book.pdf") is None
+
+    def test_runs_configured_command_with_pdf_path_appended(self, monkeypatch, tmp_path):
+        pdf = tmp_path / "book.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+        captured = {}
+
+        class _Result:
+            returncode = 0
+            stdout = "# OCR'd markdown\n\nSome recovered text."
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return _Result()
+
+        monkeypatch.setenv("BOOK_SKILL_OCR_CMD", "my-ocr-tool --flag value")
+        monkeypatch.setattr(pdf_parser.subprocess, "run", fake_run)
+
+        result = pdf_parser._ocr_via_external_command(str(pdf))
+
+        assert result == "# OCR'd markdown\n\nSome recovered text."
+        assert captured["cmd"] == ["my-ocr-tool", "--flag", "value", str(pdf.resolve())]
+
+    def test_nonzero_exit_returns_none(self, monkeypatch, tmp_path):
+        pdf = tmp_path / "book.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+
+        class _Result:
+            returncode = 1
+            stdout = ""
+            stderr = "model not found"
+
+        monkeypatch.setenv("BOOK_SKILL_OCR_CMD", "my-ocr-tool")
+        monkeypatch.setattr(pdf_parser.subprocess, "run", lambda cmd, **kwargs: _Result())
+
+        assert pdf_parser._ocr_via_external_command(str(pdf)) is None
+
+    def test_subprocess_exception_returns_none(self, monkeypatch, tmp_path):
+        pdf = tmp_path / "book.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+
+        def fake_run(cmd, **kwargs):
+            raise FileNotFoundError("my-ocr-tool not found")
+
+        monkeypatch.setenv("BOOK_SKILL_OCR_CMD", "my-ocr-tool")
+        monkeypatch.setattr(pdf_parser.subprocess, "run", fake_run)
+
+        assert pdf_parser._ocr_via_external_command(str(pdf)) is None
+
+
+class TestOcrViaTesseract:
+    """`_ocr_via_tesseract` is the universal, CPU-only last-resort OCR tier."""
+
+    def test_missing_binaries_returns_none(self, monkeypatch):
+        monkeypatch.setattr(pdf_parser.shutil, "which", lambda name: None)
+        assert pdf_parser._ocr_via_tesseract("book.pdf") is None
+
+    def test_renders_pages_and_ocrs_each_one(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            pdf_parser.shutil, "which",
+            lambda name: f"/usr/bin/{name}",
+        )
+
+        def fake_run(cmd, **kwargs):
+            class _Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            if cmd[0] == "pdftoppm":
+                out_prefix = cmd[-1]
+                out_dir = Path(out_prefix).parent
+                (out_dir / "page-01.jpg").write_bytes(b"\xff\xd8fake")
+                (out_dir / "page-02.jpg").write_bytes(b"\xff\xd8fake")
+                return _Result()
+            if cmd[0] == "tesseract":
+                page = Path(cmd[1]).name
+                r = _Result()
+                r.stdout = f"text from {page}"
+                return r
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        monkeypatch.setattr(pdf_parser.subprocess, "run", fake_run)
+
+        result = pdf_parser._ocr_via_tesseract("book.pdf")
+
+        assert result is not None
+        assert "text from page-01.jpg" in result
+        assert "text from page-02.jpg" in result
+
+    def test_pdftoppm_failure_returns_none(self, monkeypatch):
+        monkeypatch.setattr(pdf_parser.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "pdftoppm":
+                raise pdf_parser.subprocess.CalledProcessError(1, cmd)
+            raise AssertionError("tesseract should not run after pdftoppm failed")
+
+        monkeypatch.setattr(pdf_parser.subprocess, "run", fake_run)
+
+        assert pdf_parser._ocr_via_tesseract("book.pdf") is None
+
+
 class TestPdftotextCleanup:
     """clean_pdftotext strips repeated headers/footers/page numbers and dehyphenates."""
 
