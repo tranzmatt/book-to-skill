@@ -81,6 +81,7 @@ Running `/book-to-skill your-book.pdf` (or a folder, glob, or list of files) cre
 | `glossary.md` | Every key term, alphabetically sorted with chapter refs | ~1,500 tokens |
 | `patterns.md` | All techniques, algorithms, and design patterns | ~2,000 tokens |
 | `cheatsheet.md` | Decision tables and quick-reference rules | ~1,000 tokens |
+| `reference.md` *(when applicable)* | Complete data for repeated-structure content — every stat block, price, or catalog entry, not a sample. Generated when the book has large sets of reference entries (game manuals, legal codes, catalogs) and you confirm it during setup. | scales with entry count |
 
 **Chapter files are loaded on-demand** — they don't count against the skill budget until you ask about that topic.
 
