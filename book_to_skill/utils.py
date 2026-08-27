@@ -70,8 +70,12 @@ _EPUB_IMAGE_NOTICE_THRESHOLD = 5
 # those characters fell through to the whitespace-word branch, where a
 # space-less run of them counts as a single "word": the same ~1000x undercount
 # #103 fixed for the BMP, one plane up.
+# The Kangxi-radical range (U+2F00-U+2FDF) is included because some Chinese
+# ebooks render ordinary Han characters — 网 as ⽹ (U+2F79), 大 as ⼤
+# (U+2F24), 一 as ⼀ (U+2F00) — as radical forms throughout the whole text;
+# without it such a book still falls through to the whitespace-word branch.
 _CJK_RE = re.compile(
-    r"[　-〿぀-ヿ㐀-䶿一-鿿"
+    r"[⼀-⿟　-〿぀-ヿ㐀-䶿一-鿿"
     r"가-힣豈-﫿＀-￯"
     r"\U00020000-\U0003FFFF]"
 )
@@ -140,6 +144,19 @@ _CN_NUM_VALUES = {
 }
 _CN_NUM_UNITS = {"十": 10, "百": 100, "千": 1000}
 _CN_NUM_CLASS = "〇零一二两三四五六七八九十百千"
+
+# Kangxi-radical numerals → CJK ideograph numerals. Some Chinese ebooks
+# (e.g. certain e-reader platforms) encode numerals as Kangxi radicals from
+# the U+2F00 block instead of CJK unified ideographs — "第⼀章" with
+# U+2F00 (⼀) rather than U+4E00 (一). NFKC does not map these, so normalize
+# them explicitly before chapter detection. Only numerals that exist as
+# Kangxi radicals are listed (三/四/五/六/七/九 have no radical form).
+_KANGXI_NUMERAL_TRANS = {
+    0x2F00: ord("一"),  # ⼀ KANGXI RADICAL ONE
+    0x2F06: ord("二"),  # ⼆ KANGXI RADICAL TWO
+    0x2F0B: ord("八"),  # ⼋ KANGXI RADICAL EIGHT
+    0x2F17: ord("十"),  # ⼗ KANGXI RADICAL TEN
+}
 # Full-width Arabic digits (U+FF10–U+FF19) are common in Japanese typesetting,
 # e.g. "第１章". int() already parses them (str.isdigit() is True), so only the
 # regex character classes need to accept them.
@@ -155,6 +172,18 @@ _TH_DIGITS = "๐-๙"
 _TH_DIGIT_MAP = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 _TH_CHAPTER = re.compile(
     rf"^\s*(?:#{{1,6}}\s+)?(?:บทที่|ตอนที่|ภาคที่|บท|ตอน|ภาค)\s*([0-9{_TH_DIGITS}]+)\b"
+)
+
+# Hindi (Devanagari) chapter headings: "अध्याय 1", "अध्याय १", "## अध्याय 2".
+# अध्याय ("chapter") + a number. Devanagari digits (U+0966-U+096F) are positional
+# like Arabic, so — as with Thai — only a digit remap is needed, no composition.
+# Optional Markdown "#" prefix so "## अध्याय १" is recognized in converted ebooks.
+# Scoped to the digit form (not word ordinals like "पहला अध्याय") and requiring a
+# number keeps prose that merely uses the word अध्याय from matching.
+_HI_DIGITS = "०-९"
+_HI_DIGIT_MAP = str.maketrans("०१२३४५६७८९", "0123456789")
+_HI_CHAPTER = re.compile(
+    rf"^\s*(?:#{{1,6}}\s+)?अध्याय\s*([0-9{_HI_DIGITS}]+)\b"
 )
 
 # Korean chapter headings: "제1장 총칙", "## 제4장 근로시간과 휴식", "제6장의2 …".
@@ -480,7 +509,9 @@ def _roman_to_int(s: str) -> int | None:
 def _match_chapter_number(line: str) -> int | None:
     """Return the chapter number if the line is a genuine chapter heading,
     with no Markdown/AsciiDoc heading prefix (the caller strips it first)."""
-    s = line.strip()
+    # Normalize Kangxi-radical numerals (⼀⼆⼋⼗) to ideographs so Chinese
+    # ebooks that encode chapter numbers in the U+2F00 block are detected.
+    s = line.strip().translate(_KANGXI_NUMERAL_TRANS)
     if len(s) > 80:
         return None
     m = _EXPLICIT_CHAPTER.match(s)
@@ -497,6 +528,9 @@ def _match_chapter_number(line: str) -> int | None:
     tm = _TH_CHAPTER.match(s)
     if tm:
         return int(tm.group(1).translate(_TH_DIGIT_MAP))
+    hm = _HI_CHAPTER.match(s)
+    if hm:
+        return int(hm.group(1).translate(_HI_DIGIT_MAP))
     km = _KO_CHAPTER.match(s)
     if km:
         return int(km.group(1))
@@ -512,7 +546,8 @@ def _chapter_number(line: str) -> int | None:
     Handles Arabic ("Chapter 5", "Capítulo 5: ..."), Roman-numeral
     ("I: Loomings", "## i. introduction", "II. The Carpet-Bag"),
     Chinese ("第三章 …", "## 一 · …", "## 第一讲"), Thai ("บทที่ 3",
-    "## บทที่ ๑"), Korean ("제1장 총칙", "## 제4장 근로시간과 휴식"), and
+    "## บทที่ ๑"), Hindi ("अध्याय 1", "अध्याय १", "## अध्याय 2"),
+    Korean ("제1장 총칙", "## 제4장 근로시간과 휴식"), and
     Persian ("فصل ۱", "فصل اول", "فصل بیست و یکم", "بخش ۲: مفاهیم",
     "## فصل ۱: مقدمه", PDF-glued "فصل سی و چهارمخداحافظ…") heading styles — each
     optionally preceded by a Markdown/AsciiDoc heading marker
