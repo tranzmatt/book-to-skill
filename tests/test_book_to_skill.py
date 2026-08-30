@@ -648,6 +648,26 @@ class TestDetectStructure:
         assert _chapter_number("इस अध्याय में हम चर्चा करेंगे") is None
         assert _chapter_number("अध्याय") is None
 
+    def test_detects_bengali_chapters(self):
+        """Bengali headings: `অধ্যায় N`, with Bengali or Arabic digits."""
+        text = (
+            "অধ্যায় ১ ভূমিকা\nবিষয়বস্তু\n"
+            "অধ্যায় ২ পদ্ধতি\nবিষয়বস্তু\n"
+            "অধ্যায় 3 ফলাফল\nবিষয়বস্তু"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_bengali_markdown_prefix(self):
+        text = "## অধ্যায় ১ প্রথম\nবিষয়বস্তু\n## অধ্যায় ২ দ্বিতীয়\nবিষয়বস্তু"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_bengali_prose_is_not_a_chapter_heading(self):
+        """`অধ্যায়` used in prose (no number, or not at the start) is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("এই অধ্যায়ে আমরা আলোচনা করব") is None
+        assert _chapter_number("অধ্যায়") is None
+
     # ── Korean chapter headings ────────────────────────────────────────────
 
     def test_korean_je_n_jang(self):
@@ -891,6 +911,52 @@ class TestDetectStructure:
         text = "The contents of this chapter are varied and the index is long.\n"
         assert detect_structure(text)["has_toc"] is False
 
+    def test_toc_markdown_atx_heading(self):
+        # issue #126: a Markdown export writes the ToC as "## Table of Contents"
+        text = """## Table of Contents
+1. Intro
+2. Body
+"""
+        assert detect_structure(text)["has_toc"] is True
+
+    def test_toc_markdown_headers_other_languages(self):
+        text = """## 目录
+第一章 开始
+第二章 进阶
+"""
+        assert detect_structure(text)["has_toc"] is True
+
+    def test_unit_style_chapter_headings(self):
+        # course-style books: "### Unit 1 ✏ ..." must be detected as chapters
+        text = """### Unit 1 ✏ How to Write an Introduction
+body
+### Unit 2 ✏ Writing about Methodology
+body
+"""
+        assert detect_structure(text)["chapters_detected"] >= 2
+
+    def test_stray_roman_numeral_does_not_suppress_structural_count(self):
+        # a single Roman numeral inside a reproduced example paper must not
+        # outvote the structural heading count of the surrounding book
+        text = """### Introduction
+VIII. CONCLUSIONS
+### Methodology
+"""
+        result = detect_structure(text)
+        assert result["chapters_detected"] >= 2
+        assert result["chapters_method"] == "structural"
+
+    def test_unit_style_headings_count_as_numeric(self):
+        # "Unit N" headings are explicit chapters once the markdown prefix is
+        # stripped, so they take the numeric branch
+        text = """### Unit 1 ✏ How to Write an Introduction
+VIII. CONCLUSIONS
+### Unit 2 ✏ Writing about Methodology
+"""
+        result = detect_structure(text)
+        assert result["chapters_detected"] >= 2
+        assert result["chapters_method"] == "numeric" 
+
     def test_numbered_list_items_are_not_chapters(self):
         # The AI-Engineering failure: numbered list items were counted as chapters.
         text = (
@@ -918,6 +984,24 @@ class TestDetectStructure:
     def test_portuguese_capitulo(self):
         text = "Capítulo 1\nalgum texto\nCapítulo 2\nmais texto\n"
         assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_detects_plain_numbered_chapter_headings(self):
+        """Plain numbered headings such as '1  Introduction' are chapters."""
+        text = (
+            "1  Introdução e Visão Geral\n"
+            "Texto do capítulo.\n"
+            "2  Princípios Fundamentais\n"
+            "Texto do capítulo.\n"
+            "3  Produtos de Trabalho\n"
+            "Texto do capítulo.\n"
+            "4  Práticas para Elaboração\n"
+            "Texto do capítulo.\n"
+        )
+
+        result = detect_structure(text)
+
+        assert result["chapters_detected"] == 4
+        assert result["chapters_method"] == "numeric"
 
     def test_distinct_numbering_dedups_toc_and_body(self):
         # A ToC heading and the body heading for the same chapter count once.
@@ -1069,6 +1153,16 @@ class TestDetectStructure:
 
     def test_dutch_hoofdstuk(self):
         assert detect_structure("Hoofdstuk 1\nx\nHoofdstuk 2\nx")["chapters_detected"] == 2
+
+    def test_vietnamese_chuong(self):
+        assert detect_structure("Chương 1\nx\nChương 2\nx")["chapters_detected"] == 2
+
+    def test_vietnamese_chuong_not_program(self):
+        # "Chương trình" (program) starts with the chapter word but is not a
+        # heading — no number follows "Chương", so it must not match.
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("Chương trình 1 của khóa học") is None
 
     def test_german_kapitel_with_title(self):
         text = "Kapitel 1: Einführung\nx\nKapitel 2: Methoden\nx"
@@ -1797,7 +1891,7 @@ class TestTextEncodingDetection:
 class TestPdftotextEncoding:
     """pdftotext output (UTF-8) is decoded as UTF-8, not the locale encoding."""
 
-    def test_pdftotext_decodes_as_utf8(self, monkeypatch):
+    def test_pdftotext_requests_utf8_output(self, monkeypatch):
         captured = {}
 
         class _Result:
@@ -1807,6 +1901,7 @@ class TestPdftotextEncoding:
         monkeypatch.setattr(pdf_parser.shutil, "which", lambda name: "/usr/bin/pdftotext")
 
         def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
             captured.update(kwargs)
             return _Result()
 
@@ -1815,7 +1910,33 @@ class TestPdftotextEncoding:
         assert pdf_parser.extract_with_pdftotext("x.pdf") == "Café — naïve"
         assert captured.get("encoding") == "utf-8"
         assert captured.get("errors") == "replace"
+        cmd = captured.get("cmd") or []
+        assert "-enc" in cmd and cmd[cmd.index("-enc") + 1] == "UTF-8"
 
+
+class TestPdfPageCount:
+    """Tests for PDF page-count fallback behavior."""
+
+    def test_count_pages_uses_pdfminer_when_pdfinfo_and_pypdf_are_unavailable(
+        self, monkeypatch
+    ):
+        """Use pdfminer as the final fallback when other page counters are unavailable."""
+        fake_pdf = "fake.pdf"
+
+        monkeypatch.setattr(pdf_parser.shutil, "which", lambda _: None)
+
+        high_level = mock.MagicMock()
+        high_level.extract_text.return_value = (
+            "page one\fpage two\fpage three"
+        )
+
+        pdfminer = mock.MagicMock()
+        pdfminer.high_level = high_level
+
+        monkeypatch.setitem(sys.modules, "pdfminer", pdfminer)
+        monkeypatch.setitem(sys.modules, "pdfminer.high_level", high_level)
+
+        assert pdf_parser.count_pages(fake_pdf) == 3
 
 class TestLooksImageOnly:
     """Scanned PDFs are caught by probing the first pages, before the chain runs."""

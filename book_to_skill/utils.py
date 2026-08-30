@@ -101,19 +101,20 @@ def estimate_tokens(text: str) -> int:
 
 
 # Explicit chapter heading: "Chapter 5", "Capítulo 5: ...", "Chapter 1. Intro".
-# Also French/German/Italian/Dutch chapter words (chapitre/kapitel/capitolo/
-# hoofdstuk), matching the ToC languages added alongside. "ch.?" stays last so
-# the longer words match in full. Captures the number (bounded to 1..99 — drops
-# years like "2025.") and whatever follows it on the line, so we can reject prose.
+# Also French/German/Italian/Dutch/Vietnamese chapter words (chapitre/kapitel/
+# capitolo/hoofdstuk/chương), matching the ToC languages added alongside. "ch.?"
+# stays last so the longer words match in full. Captures the number (bounded to
+# 1..99 — drops years like "2025.") and whatever follows it on the line, so we
+# can reject prose.
 _EXPLICIT_CHAPTER = re.compile(
-    r"^\s*(?:chapter|chapitre|kapitel|cap[ií]tulo|capitolo|hoofdstuk|ch\.?)\s*(?:(\d{1,2})|(?P<roman>[IVXLCDMivxlcdm]{1,7}))\b(?P<rest>.*)$",
+    r"^\s*(?:chapter|unit|lesson|module|lecture|part|chapitre|kapitel|cap[ií]tulo|capitolo|hoofdstuk|chương|ch\.?)\s*(?:(\d{1,2})|(?P<roman>[IVXLCDMivxlcdm]{1,7}))\b(?P<rest>.*)$",
     re.IGNORECASE,
 )
 # A heading's number is followed by end-of-line, punctuation (“. : - —“), or a
 # Capitalized title word. A lowercase continuation (“Chapter 6 explores...”,
 # “Chapter 8 are relevant...”) is prose / a cross-reference, not a heading.
 # The uppercase class is À-Þ so titles starting with Ü/Û (common in German, e.g. “Überblick”) are recognized.
-_HEADING_TAIL = re.compile(r"^\s*$|^\s*[.:\-—–]|^\s+[A-ZÀ-Þ0-9\"“(]")
+_HEADING_TAIL = re.compile(r"^\s*$|^\s*[.:\-—–]|^\s+(?![a-z])")
 
 # Roman-numeral chapter heading: "I: Loomings", "II. The Carpet-Bag".
 # Uppercase alone at line start is safe — no common English word is a valid
@@ -184,6 +185,17 @@ _HI_DIGITS = "०-९"
 _HI_DIGIT_MAP = str.maketrans("०१२३४५६७८९", "0123456789")
 _HI_CHAPTER = re.compile(
     rf"^\s*(?:#{{1,6}}\s+)?अध्याय\s*([0-9{_HI_DIGITS}]+)\b"
+)
+
+# Bengali chapter headings: "অধ্যায় 1", "অধ্যায় ১", "## অধ্যায় 2".
+# অধ্যায় ("chapter") + a number. Bengali digits (U+09E6-U+09EF) are positional
+# like the Hindi block above, so only a digit remap is needed. Optional Markdown
+# "#" prefix so "## অধ্যায় ১" is recognized in converted ebooks. Requiring a
+# number keeps prose that merely uses the word অধ্যায় from matching.
+_BN_DIGITS = "০-৯"
+_BN_DIGIT_MAP = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+_BN_CHAPTER = re.compile(
+    rf"^\s*(?:#{{1,6}}\s+)?অধ্যায়\s*([0-9{_BN_DIGITS}]+)\b"
 )
 
 # Korean chapter headings: "제1장 총칙", "## 제4장 근로시간과 휴식", "제6장의2 …".
@@ -296,7 +308,7 @@ _TOC_HEADERS = (
 )
 _TOC_CJK_PATTERN = r"目[ \t\u3000]*(?:录|錄|次)"
 _TOC_PATTERN = re.compile(
-    r"^\s*(?:"
+    r"^\s*(?:#{1,6}\s*)?(?:"
     + "|".join([*(re.escape(h) for h in _TOC_HEADERS), _TOC_CJK_PATTERN])
     + r")\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -508,35 +520,58 @@ def _roman_to_int(s: str) -> int | None:
 
 def _match_chapter_number(line: str) -> int | None:
     """Return the chapter number if the line is a genuine chapter heading,
-    with no Markdown/AsciiDoc heading prefix (the caller strips it first)."""
+    with no Markdown/AsciiDoc heading prefix (the caller strips it first).
+    """
     # Normalize Kangxi-radical numerals (⼀⼆⼋⼗) to ideographs so Chinese
     # ebooks that encode chapter numbers in the U+2F00 block are detected.
     s = line.strip().translate(_KANGXI_NUMERAL_TRANS)
+
     if len(s) > 80:
         return None
+
+    # Plain numbered chapter headings used by many technical books,
+    # e.g. "1  Introduction" or "12  Advanced Topics".
+    #
+    # Require at least two spaces after the chapter number. This avoids
+    # treating ordinary numbered list items such as "1. Item" as chapters.
+    plain = re.match(r"^([1-9]\d{0,2})\s{2,}\S", s)
+    if plain:
+        return int(plain.group(1))
+
     m = _EXPLICIT_CHAPTER.match(s)
     if m and _HEADING_TAIL.match(m.group("rest")):
         if m.group(1):
             return int(m.group(1))
         return _roman_to_int(m.group("roman").upper())
+
     rm = _ROMAN_HEAD.match(s) or _LC_MD_ROMAN.match(s)
     if rm:
         return _roman_to_int(rm.group(1))
+
     cm = _CN_CHAPTER.match(s) or _MD_CN_HEADING.match(s)
     if cm:
         return _cn_numeral_to_int(cm.group(1))
+
     tm = _TH_CHAPTER.match(s)
     if tm:
         return int(tm.group(1).translate(_TH_DIGIT_MAP))
+
     hm = _HI_CHAPTER.match(s)
     if hm:
         return int(hm.group(1).translate(_HI_DIGIT_MAP))
+
+    bm = _BN_CHAPTER.match(s)
+    if bm:
+        return int(bm.group(1).translate(_BN_DIGIT_MAP))
+
     km = _KO_CHAPTER.match(s)
     if km:
         return int(km.group(1))
+
     fa = _fa_chapter_number(s)
     if fa is not None:
         return fa
+
     return None
 
 
@@ -547,6 +582,7 @@ def _chapter_number(line: str) -> int | None:
     ("I: Loomings", "## i. introduction", "II. The Carpet-Bag"),
     Chinese ("第三章 …", "## 一 · …", "## 第一讲"), Thai ("บทที่ 3",
     "## บทที่ ๑"), Hindi ("अध्याय 1", "अध्याय १", "## अध्याय 2"),
+    Bengali ("অধ্যায় 1", "অধ্যায় ১", "## অধ্যায় 2"),
     Korean ("제1장 총칙", "## 제4장 근로시간과 휴식"), and
     Persian ("فصل ۱", "فصل اول", "فصل بیست و یکم", "بخش ۲: مفاهیم",
     "## فصل ۱: مقدمه", PDF-glued "فصل سی و چهارمخداحافظ…") heading styles — each
@@ -596,12 +632,21 @@ def detect_structure(text: str) -> dict:
     # Every parser in this project already announces which method it used
     # ("Trying python-docx... OK"); this decision had the same shape and was
     # the only silent one.
-    if numeric_count > 0:
+    if numeric_count >= 2:
         chapters_detected = numeric_count
         chapters_method = "numeric"
     else:
-        chapters_detected = _structural_chapter_count(text)
-        chapters_method = "structural" if chapters_detected else "none"
+        # A single stray number (e.g. a Roman numeral inside an example paper
+        # reproduced in the book, or a lone "Part 1") is not enough to suppress
+        # the structural (Markdown/AsciiDoc) heading count, so course-style
+        # books with "### Unit N" headings still get counted via max().
+        structural_count = _structural_chapter_count(text)
+        chapters_detected = max(numeric_count, structural_count)
+        chapters_method = (
+            "structural" if structural_count > numeric_count
+            else "numeric" if numeric_count
+            else "none"
+        )
 
     # Look for ToC indicators in the first ~30k chars (multilingual; see _TOC_PATTERN)
     has_toc = bool(_TOC_PATTERN.search(text[:30000]))
