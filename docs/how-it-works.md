@@ -41,6 +41,9 @@ scripts/extract.py <paths…> --mode <technical|text>
             ~/.claude/skills/<slug>/    (symlink → above, attempted under
                                          Claude Code and verified by
                                          read-back; report states the result)
+            ${OPENCLAW_STATE_DIR:-~/.openclaw}/skills/<slug>/  (OpenClaw active
+                                         state; shared ~/.agents/skills works
+                                         only with the default state)
             $HERMES_HOME/skills/<category>/<slug>/
                                         (Hermes Agent: its own personal root,
                                          not the cross-agent one, no symlink)

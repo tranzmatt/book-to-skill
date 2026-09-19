@@ -1,12 +1,12 @@
 ---
-description: "Install book-to-skill as an agent skill for Claude Code, GitHub Copilot CLI, Amp, Codex and Hermes Agent, or as a standalone pip CLI. Every host path and optional extractor covered."
-seo_title: "Install book-to-skill - Claude Code, Copilot CLI, Amp, Hermes, or pip"
+description: "Install book-to-skill as an agent skill for Claude Code, GitHub Copilot CLI, Amp, Codex, Hermes Agent and OpenClaw, or as a standalone pip CLI. Every host path and optional extractor covered."
+seo_title: "Install book-to-skill - Claude Code, Copilot CLI, Amp, Hermes, OpenClaw, or pip"
 ---
 
 ## 📥 Install
 
 > **Two ways to use it, do not confuse them:**
-> - **As an agent skill** (the `/book-to-skill` command in Claude Code, Copilot CLI, Amp, Codex, or Hermes Agent) → **`git clone` into your skills folder** (below). This is what gives you the slash command and the full convert-a-book flow.
+> - **As an agent skill** (the `/book-to-skill` command in Claude Code, Copilot CLI, Amp, Codex, Hermes Agent, or OpenClaw) → **`git clone` into your skills folder** (below). This is what gives you the slash command and the full convert-a-book flow.
 > - **As a standalone CLI** (just the text extractor) → `pip install` it from the repository, then `book-to-skill --help`. This does **not** register the agent skill; it only installs the extraction engine. See [the CLI section](#standalone-cli-pip).
 
 The skill follows the open [Agent Skills](https://github.com/agentskills/agentskills) standard, so a single install works for any compatible host.
@@ -38,6 +38,22 @@ git clone https://github.com/virgiliojr94/book-to-skill.git ~/.agents/skills/boo
 
 ```bash
 ln -s /path/to/book-to-skill ~/.agents/skills/book-to-skill
+```
+
+**OpenClaw**:
+
+```bash
+git clone https://github.com/virgiliojr94/book-to-skill.git "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/skills/book-to-skill"
+# Shared cross-agent path; OpenClaw discovers this only with the default state:
+# git clone https://github.com/virgiliojr94/book-to-skill.git ~/.agents/skills/book-to-skill
+```
+
+OpenClaw discovers skills under the active state directory's `skills/` root, `<workspace>/skills/book-to-skill`, and explicitly configured `skills.load.extraDirs` (up to 6 grouping levels). The shared `~/.agents/skills` compatibility root is discovered only when `OPENCLAW_STATE_DIR` is unset or uses the default `~/.openclaw`; a non-default state does not index that home-scoped root. Verify with `openclaw skills list` — it watches `SKILL.md` by default. Grouped layouts like `${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/skills/group/subgroup/book-to-skill` also work.
+
+The converter probes the active OpenClaw state root and workspace `skills/` layouts, including flat and grouped paths up to six grouping levels. It does not infer arbitrary `skills.load.extraDirs`; if you configure extra directories, verify the resulting path explicitly with `openclaw skills list`.
+
+```bash
+openclaw skills list
 ```
 
 **Hermes Agent**:

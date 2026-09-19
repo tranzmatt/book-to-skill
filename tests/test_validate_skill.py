@@ -35,6 +35,39 @@ def test_hermes_lens_accepts_standard_skill(tmp_path):
     assert errors == []
 
 
+def test_openclaw_lens_accepts_openclaw_metadata(tmp_path):
+    p = tmp_path / "SKILL.md"
+    p.write_text(
+        "---\n"
+        "name: openclaw-skill\n"
+        "description: A test skill.\n"
+        "homepage: https://example.com/skill\n"
+        "user-invocable: true\n"
+        "disable-model-invocation: false\n"
+        "command-dispatch: tool\n"
+        "command-tool: example\n"
+        "command-arg-mode: raw\n"
+        "metadata:\n"
+        "  openclaw:\n"
+        "    emoji: book\n"
+        "---\n\n# Body\n",
+        encoding="utf-8",
+    )
+    errors, warns = validate_skill.audit(str(p), lens="openclaw")
+    assert errors == []
+    assert not [warning for warning in warns if "frontmatter" in warning]
+
+
+def test_openclaw_lens_rejects_underscore_identifiers(tmp_path):
+    p = tmp_path / "SKILL.md"
+    p.write_text(
+        "---\nname: invalid_skill\ndescription: A test skill.\n---\n\n# Body\n",
+        encoding="utf-8",
+    )
+    errors, _ = validate_skill.audit(str(p), lens="openclaw")
+    assert any("name:" in error for error in errors)
+
+
 def test_hermes_lens_recognizes_hermes_metadata(tmp_path):
     p = tmp_path / "SKILL.md"
     p.write_text(
