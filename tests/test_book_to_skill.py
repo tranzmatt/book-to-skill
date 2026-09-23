@@ -708,6 +708,26 @@ class TestDetectStructure:
         assert _chapter_number("ఈ అధ్యాయంలో మనం చర్చిస్తాము") is None
         assert _chapter_number("అధ్యాయం") is None
 
+    def test_detects_kannada_chapters(self):
+        """Kannada headings: `ಅಧ್ಯಾಯ N`, Kannada or Arabic digits."""
+        text = (
+            "ಅಧ್ಯಾಯ ೧ ಪರಿಚಯ\nಸಾರಾಂಶ\n"
+            "ಅಧ್ಯಾಯ ೨ ವಿಧಾನಗಳು\nಸಾರಾಂಶ\n"
+            "ಅಧ್ಯಾಯ 3 ಫಲಿತಾಂಶಗಳು\nಸಾರಾಂಶ"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_kannada_markdown_prefix(self):
+        text = "## ಅಧ್ಯಾಯ ೧ ಮೊದಲನೆಯ\nಸಾರಾಂಶ\n## ಅಧ್ಯಾಯ ೨ ಎರಡನೆಯ\nಸಾರಾಂಶ"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_kannada_prose_is_not_a_chapter_heading(self):
+        """An inflected form (ಅಧ್ಯಾಯದಲ್ಲಿ) or a bare word is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ಈ ಅಧ್ಯಾಯದಲ್ಲಿ ನಾವು ಚರ್ಚಿಸುತ್ತೇವೆ") is None
+        assert _chapter_number("ಅಧ್ಯಾಯ") is None
+
     def test_detects_russian_chapters(self):
         """Russian headings: `Глава N`, case-insensitive, with Arabic digits."""
         text = (
@@ -1799,6 +1819,22 @@ class TestDocxTableReconstruction:
         out = extract_docx_with_zipfile(self._make_docx(tmp_path, body))
         assert out == "Just a paragraph\nAnd another"
 
+    def test_inline_tabs_are_preserved(self, tmp_path):
+        body = (
+            "<w:p><w:r><w:t>Term</w:t><w:tab/><w:t>Definition</w:t>"
+            "</w:r></w:p>"
+        )
+        out = extract_docx_with_zipfile(self._make_docx(tmp_path, body))
+        assert out == "Term\tDefinition"
+
+    def test_inline_breaks_are_preserved(self, tmp_path):
+        body = (
+            "<w:p><w:r><w:t>First line</w:t><w:br/><w:t>Second line</w:t>"
+            "<w:cr/><w:t>Third line</w:t></w:r></w:p>"
+        )
+        out = extract_docx_with_zipfile(self._make_docx(tmp_path, body))
+        assert out == "First line\nSecond line\nThird line"
+
     def test_empty_cell_still_tab_joined(self, tmp_path):
         body = (
             "<w:tbl><w:tr>" + self._cell("A")
@@ -1898,6 +1934,30 @@ class TestEpubSpineOrder:
             self._make_epub(tmp_path, opf, files, opf_name="OEBPS/content.opf")
         )
         assert "SUBDIR" in out
+
+    def test_manifest_href_fragment_is_not_part_of_archive_name(self, tmp_path):
+        opf = (
+            '<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest>'
+            '<item id="c1" href="chapter.xhtml#section-2" '
+            'media-type="application/xhtml+xml"/>'
+            '</manifest><spine><itemref idref="c1"/></spine></package>'
+        )
+        files = {"chapter.xhtml": self._doc("FRAGMENT")}
+        out = extract_with_zipfile(self._make_epub(tmp_path, opf, files))
+        assert "FRAGMENT" in out
+
+    def test_manifest_href_percent_encoding_maps_to_archive_name(self, tmp_path):
+        opf = (
+            '<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest>'
+            '<item id="c1" href="Text/Chapter%201.xhtml" '
+            'media-type="application/xhtml+xml"/>'
+            '</manifest><spine><itemref idref="c1"/></spine></package>'
+        )
+        files = {"OEBPS/Text/Chapter 1.xhtml": self._doc("ENCODED")}
+        out = extract_with_zipfile(
+            self._make_epub(tmp_path, opf, files, opf_name="OEBPS/content.opf")
+        )
+        assert "ENCODED" in out
 
     def test_non_self_closing_item_tag(self, tmp_path):
         # <item ...></item> (non-self-closing) is parsed via its opening tag.
