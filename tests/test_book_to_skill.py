@@ -38,7 +38,7 @@ from book_to_skill.parsers import pdf as pdf_parser
 from book_to_skill.parsers.text import read_text_file
 from book_to_skill.parsers.docx import extract_docx_with_zipfile
 from book_to_skill.parsers.rtf import strip_rtf_fallback
-from book_to_skill.parsers.epub import extract_with_zipfile
+from book_to_skill.parsers.epub import count_epub_chapters, extract_with_zipfile
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -727,6 +727,26 @@ class TestDetectStructure:
 
         assert _chapter_number("ಈ ಅಧ್ಯಾಯದಲ್ಲಿ ನಾವು ಚರ್ಚಿಸುತ್ತೇವೆ") is None
         assert _chapter_number("ಅಧ್ಯಾಯ") is None
+
+    def test_detects_malayalam_chapters(self):
+        """Malayalam headings: both spellings (അധ്യായം/അദ്ധ്യായം), Malayalam or Arabic digits."""
+        text = (
+            "അധ്യായം ൧ ആമുഖം\nസംഗ്രഹം\n"
+            "അദ്ധ്യായം ൨ രീതികൾ\nസംഗ്രഹം\n"
+            "അധ്യായം 3 ഫലങ്ങൾ\nസംഗ്രഹം"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_malayalam_markdown_prefix(self):
+        text = "## അധ്യായം ൧ ഒന്നാമത്തേത്\nസംഗ്രഹം\n## അദ്ധ്യായം ൨ രണ്ടാമത്തേത്\nസംഗ്രഹം"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_malayalam_prose_is_not_a_chapter_heading(self):
+        """An inflected form (അധ്യായത്തിൽ) or a bare word is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ഈ അധ്യായത്തിൽ നാം ചർച്ച ചെയ്യുന്നു") is None
+        assert _chapter_number("അധ്യായം") is None
 
     def test_detects_russian_chapters(self):
         """Russian headings: `Глава N`, case-insensitive, with Arabic digits."""
@@ -1889,6 +1909,32 @@ class TestEpubSpineOrder:
         files = {"ch1.xhtml": self._doc("FIRST"), "ch2.xhtml": self._doc("SECOND")}
         out = extract_with_zipfile(self._make_epub(tmp_path, opf, files))
         assert out.index("FIRST") < out.index("SECOND")
+
+    def test_prefixed_opf_elements_preserve_spine_order_and_count(self, tmp_path):
+        # XML namespace prefixes are semantically equivalent to the default OPF
+        # namespace. File names deliberately sort opposite to the spine so a
+        # missed prefixed manifest/spine cannot pass through the sorted fallback.
+        opf = (
+            '<opf:package xmlns:opf="http://www.idpf.org/2007/opf" version="3.0">'
+            '<opf:manifest>'
+            '<opf:item id="c1" href="z-first.xhtml" '
+            'media-type="application/xhtml+xml"/>'
+            '<opf:item id="c2" href="a-second.xhtml" '
+            'media-type="application/xhtml+xml"/>'
+            '</opf:manifest><opf:spine>'
+            '<opf:itemref idref="c1"/><opf:itemref idref="c2"/>'
+            '</opf:spine></opf:package>'
+        )
+        files = {
+            "z-first.xhtml": self._doc("FIRST"),
+            "a-second.xhtml": self._doc("SECOND"),
+        }
+        epub_path = self._make_epub(tmp_path, opf, files)
+
+        out = extract_with_zipfile(epub_path)
+
+        assert out.index("FIRST") < out.index("SECOND")
+        assert count_epub_chapters(epub_path) == 2
 
     def test_non_spine_doc_kept_as_safety_net_after_spine(self, tmp_path):
         opf = (
