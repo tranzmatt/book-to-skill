@@ -7,6 +7,7 @@ import os
 import re
 import statistics
 import sys
+from collections import Counter
 
 import shutil
 import zipfile
@@ -242,6 +243,21 @@ _TA_CHAPTER = re.compile(
     rf"^\s*(?:#{{1,6}}\s+)?அத்தியாயம்\s*([0-9{_TA_DIGITS}]+)\b"
 )
 
+# Sinhala chapter headings: "පරිච්ඡේදය 1", "පරිච්ඡේදය ෨", "## පරිච්ඡේදය 2".
+# පරිච්ඡේදය ("chapter") + a number. Grouped next to Tamil as the other Sri
+# Lankan script. Modern Sinhala prints numbers with ASCII digits; the Lith
+# digits (U+0DE6-U+0DEF) are included for historical texts, remapped like the
+# other Indic blocks. Only පරිච්ඡේදය is matched, not the Sanskrit loan අධ්‍යාය:
+# that word carries a ZERO WIDTH JOINER inside its conjunct, and
+# sanitize_extracted_text() strips U+200D before detect_structure() ever sees
+# the text, so a pattern containing one could never match. Requiring a number
+# keeps prose that merely inflects the word ("පරිච්ඡේදයේ") from matching.
+_SI_DIGITS = "෦-෯"
+_SI_DIGIT_MAP = str.maketrans("෦෧෨෩෪෫෬෭෮෯", "0123456789")
+_SI_CHAPTER = re.compile(
+    rf"^\s*(?:#{{1,6}}\s+)?පරිච්ඡේදය\s*([0-9{_SI_DIGITS}]+)\b"
+)
+
 # Telugu chapter headings: "అధ్యాయము 1", "అధ్యాయం ౧", "## అధ్యాయం 2".
 # The chapter word has two common spellings — అధ్యాయము (formal) and అధ్యాయం
 # (modern), sharing the stem అధ్యాయ — so both endings are matched. Telugu digits
@@ -291,6 +307,21 @@ _GU_DIGITS = "૦-૯"
 _GU_DIGIT_MAP = str.maketrans("૦૧૨૩૪૫૬૭૮૯", "0123456789")
 _GU_CHAPTER = re.compile(
     rf"^\s*(?:#{{1,6}}\s+)?(?:પ્રકરણ|અધ્યાય)\s*([0-9{_GU_DIGITS}]+)\b"
+)
+
+# Punjabi (Gurmukhi) chapter headings: "ਕਾਂਡ 1", "ਅਧਿਆਇ ੧", "## ਕਾਂਡ 2".
+# Like Gujarati above, Punjabi uses two distinct words for "chapter" — ਕਾਂਡ
+# (usual in books) and ਅਧਿਆਇ — so both are matched. ਅਧਿਆਇ resembles Gujarati
+# અધ્યાય and Devanagari अध्याय but the scripts are disjoint (Gurmukhi
+# U+0A00-U+0A7F, Gujarati U+0A80-U+0AFF, Devanagari U+0900-U+097F), so none of
+# the three patterns can see another's text. Gurmukhi digits (U+0A66-U+0A6F) are
+# positional, so only a digit remap is needed. Requiring a number right after
+# the word keeps prose from matching, whether it follows the word with a
+# postposition ("ਕਾਂਡ ਵਿੱਚ") or inflects it ("ਕਾਂਡਾਂ").
+_PA_DIGITS = "੦-੯"
+_PA_DIGIT_MAP = str.maketrans("੦੧੨੩੪੫੬੭੮੯", "0123456789")
+_PA_CHAPTER = re.compile(
+    rf"^\s*(?:#{{1,6}}\s+)?(?:ਕਾਂਡ|ਅਧਿਆਇ)\s*([0-9{_PA_DIGITS}]+)\b"
 )
 
 # Russian (Cyrillic) chapter headings: "Глава 1", "ГЛАВА 12", "## Глава 2".
@@ -374,6 +405,13 @@ def _fa_ordinal_map() -> dict[str, int]:
     for i, w in enumerate(_FA_COMPOUND_ONES, 1):
         m[f"بیست و {w}"] = 20 + i
         m[f"سی و {w}"] = 30 + i
+    # sanitize_extracted_text() strips U+200C (it is a prompt-injection spacer)
+    # before detect_structure() runs, so a key spelled with a ZWNJ can never be
+    # reached through the pipeline. Register the stripped spelling of every such
+    # key as well, so both the typographic form and what detection actually
+    # receives resolve to the same chapter number.
+    for key, value in list(m.items()):
+        m.setdefault(key.replace("\u200c", ""), value)
     return m
 
 
@@ -456,7 +494,8 @@ _BACK_MATTER_HEADERS = (
     "about the authors",
 )
 _NON_CHAPTER_HEADERS = frozenset((*_FRONT_MATTER_HEADERS, *_BACK_MATTER_HEADERS))
-_NON_CHAPTER_PREFIX = re.compile(r"^(?:appendix|appendices|part)\b", re.IGNORECASE)
+_NON_CHAPTER_PREFIX = re.compile(r"^(?:appendix|appendices)\b", re.IGNORECASE)
+_PART_HEADER = re.compile(r"^part\s+(?:\d+|[ivxlcdm]+)\b", re.IGNORECASE)
 
 
 def _is_non_chapter_section(title: str) -> bool:
@@ -466,6 +505,7 @@ def _is_non_chapter_section(title: str) -> bool:
         normalized.casefold() in _NON_CHAPTER_HEADERS
         or bool(_TOC_PATTERN.fullmatch(normalized))
         or bool(_NON_CHAPTER_PREFIX.match(normalized))
+        or bool(_PART_HEADER.match(normalized))
     )
 
 # ATX-style heading: "# Title", "## Section", AsciiDoc "= Title", "== Section".
@@ -493,19 +533,25 @@ def _closed_fence_line_numbers(lines: list[str]) -> set[int]:
     Counting a handful of code lines as prose is a far cheaper mistake than
     losing most of a book's structure.
 
-    The closing fence must use the SAME character as its opener, per CommonMark,
-    so a "```" block is no longer terminated by an unrelated "~~~" line.
+    Per CommonMark, a closer must use the same character, be at least as long
+    as its opener, and have no trailing info string. A longer fence can then
+    safely contain examples of shorter fences without exposing sample headings.
     """
     inside: set[int] = set()
     opener: tuple[str, int] | None = None
     for index, line in enumerate(lines):
-        match = _CODE_FENCE.match(line.strip())
+        stripped = line.strip()
+        match = _CODE_FENCE.match(stripped)
         if not match:
             continue
         marker = match.group(1)
         if opener is None:
-            opener = (marker[0], index)
-        elif marker[0] == opener[0]:
+            opener = (marker, index)
+        elif (
+            marker[0] == opener[0][0]
+            and len(marker) >= len(opener[0])
+            and not stripped[match.end():]
+        ):
             # Include both fence marker lines themselves.
             inside.update(range(opener[1], index + 1))
             opener = None
@@ -772,6 +818,9 @@ def _match_chapter_number(
     tam = _TA_CHAPTER.match(s)
     if tam:
         return int(tam.group(1).translate(_TA_DIGIT_MAP))
+    sim = _SI_CHAPTER.match(s)
+    if sim:
+        return int(sim.group(1).translate(_SI_DIGIT_MAP))
     tem = _TE_CHAPTER.match(s)
     if tem:
         return int(tem.group(1).translate(_TE_DIGIT_MAP))
@@ -784,6 +833,9 @@ def _match_chapter_number(
     gum = _GU_CHAPTER.match(s)
     if gum:
         return int(gum.group(1).translate(_GU_DIGIT_MAP))
+    pam = _PA_CHAPTER.match(s)
+    if pam:
+        return int(pam.group(1).translate(_PA_DIGIT_MAP))
     rum = _RU_CHAPTER.match(s)
     if rum:
         return int(rum.group(1))
@@ -815,10 +867,12 @@ def _chapter_number(line: str, prev_line: str | None = None) -> int | None:
     Bengali ("অধ্যায় 1", "অধ্যায় ১", "## অধ্যায় 2"),
     Odia ("ଅଧ୍ୟାୟ 1", "ଅଧ୍ୟାୟ ୧", "## ଅଧ୍ୟାୟ 2"),
     Tamil ("அத்தியாயம் 1", "அத்தியாயம் ௧", "## அத்தியாயம் 2"),
+    Sinhala ("පරිච්ඡේදය 1", "පරිච්ඡේදය ෨", "## පරිච්ඡේදය 2"),
     Telugu ("అధ్యాయము 1", "అధ్యాయం ౧", "## అధ్యాయం 2"),
     Kannada ("ಅಧ್ಯಾಯ 1", "ಅಧ್ಯಾಯ ೧", "## ಅಧ್ಯಾಯ 2"),
     Malayalam ("അധ്യായം 1", "അധ്യായം ൧", "## അദ്ധ്യായം 2"),
     Gujarati ("પ્રકરણ 1", "અધ્યાય ૧", "## પ્રકરણ 2"),
+    Punjabi ("ਕਾਂਡ 1", "ਅਧਿਆਇ ੧", "## ਕਾਂਡ 2"),
     Russian ("Глава 1", "ГЛАВА 12", "## Глава 2"),
     Greek ("Κεφάλαιο 1", "ΚΕΦΑΛΑΙΟ 12", "## Κεφάλαιο 2"),
     Korean ("제1장 총칙", "## 제4장 근로시간과 휴식"), and
@@ -869,6 +923,8 @@ def detect_structure(text: str) -> dict:
 
     headings = []
     numbers = set()
+    part_headings = []
+    part_numbers = set()
     prev = ""  # previous non-blank line; cleared by blanks and fences
     for index, line in enumerate(lines):
         if index in fenced:
@@ -880,8 +936,13 @@ def detect_structure(text: str) -> dict:
             continue
         num = _chapter_number(line, prev)
         if num is not None:
-            numbers.add(num)
-            headings.append(s)
+            title = _MD_HEADING_PREFIX.sub("", s)
+            if _PART_HEADER.match(title):
+                part_numbers.add(num)
+                part_headings.append(s)
+            else:
+                numbers.add(num)
+                headings.append(s)
         prev = s
     numeric_count = len(numbers)
     # Fall back to structural (Markdown/AsciiDoc) headings only when no numeric
@@ -904,6 +965,12 @@ def detect_structure(text: str) -> dict:
         # books with "### Unit N" headings still get counted via max().
         structural_headings = _structural_chapter_headings(text)
         structural_count = len(structural_headings)
+        # Parts group chapters and must not win the numeric branch ahead of
+        # the structural chapters inside them. Retain the old Part-only
+        # fallback when the extraction contains no other chapter evidence.
+        if not numeric_count and not structural_count:
+            numeric_count = len(part_numbers)
+            headings = part_headings
         chapters_detected = max(numeric_count, structural_count)
         chapters_method = (
             "structural" if structural_count > numeric_count
@@ -1070,16 +1137,16 @@ def reuse_is_safe(current_inputs, metadata, current_mode):
     if len(recorded) != len(current_inputs):
         return False, "sources changed"
 
-    current = {}
-    for path, fingerprint in current_inputs:
-        current[Path(path).name] = fingerprint
-    if len(current) != len(recorded):
-        # Duplicate filenames cannot be matched one-to-one.
-        return False, "sources changed"
+    current_pairs = [(Path(path).name, fingerprint) for path, fingerprint in current_inputs]
+    current_by_name = {}
+    for filename, fingerprint in current_pairs:
+        current_by_name.setdefault(filename, []).append(fingerprint)
+
+    recorded_pairs = []
 
     for src in recorded:
         filename = src.get("filename")
-        if filename not in current:
+        if filename not in current_by_name:
             return False, f"sources changed (recorded {filename!r} is not in this run)"
         recorded_hash = src.get("sha256")
         if not recorded_hash:
@@ -1087,8 +1154,21 @@ def reuse_is_safe(current_inputs, metadata, current_mode):
                 f"no recorded fingerprint for {filename} — legacy metadata "
                 "(recorded before fingerprints existed)"
             )
-        if recorded_hash != current[filename]:
-            return False, f"content changed for {filename}"
+        recorded_pairs.append((filename, recorded_hash))
+
+    if recorded_pairs != current_pairs:
+        if Counter(recorded_pairs) == Counter(current_pairs):
+            return False, "sources reordered"
+
+        recorded_name_counts = Counter(filename for filename, _ in recorded_pairs)
+        current_name_counts = Counter(filename for filename, _ in current_pairs)
+        if all(count == 1 for count in recorded_name_counts.values()) and all(
+            count == 1 for count in current_name_counts.values()
+        ):
+            for filename, recorded_hash in recorded_pairs:
+                if recorded_hash != current_by_name[filename][0]:
+                    return False, f"content changed for {filename}"
+        return False, "sources changed"
 
     return True, "workdir intact and all sources match the current inputs"
 
@@ -1154,6 +1234,7 @@ def extract_single_file(input_path: Path, extraction_mode: str, install_mode: st
         
     text = ""
     method = ""
+    fallback_reason = None
     pages = 0
     pages_label = "sections"
     images_dropped = None
@@ -1196,14 +1277,33 @@ def extract_single_file(input_path: Path, extraction_mode: str, install_mode: st
                 "  ocrmypdf input.pdf output.pdf"
             )
         if extraction_mode == "technical":
-            print("Mode: technical — using Docling (layout-aware)...", end=" ", flush=True)
+            print("Mode: technical — using Docling (layout-aware)...")
             docling_info: dict = {}
-            text = extract_with_docling(input_str, _info=docling_info)
+            try:
+                text = extract_with_docling(input_str, False, docling_info)
+            except Exception as exc:
+                fallback_reason = "docling_failed"
+                print(
+                    f"WARNING: Docling failed ({type(exc).__name__}: {exc}); "
+                    "using the PDF text fallback chain.",
+                    file=sys.stderr,
+                )
+                text = None
             if text and text.strip():
                 method = "docling+ocr" if docling_info.get("used_ocr") else "docling"
                 print("OK")
             else:
-                print("not available, falling back to pdftotext")
+                if fallback_reason is None:
+                    if text is None:
+                        fallback_reason = "docling_unavailable"
+                        detail = "Docling is unavailable"
+                    else:
+                        fallback_reason = "docling_empty"
+                        detail = "Docling produced no text"
+                    print(
+                        f"WARNING: {detail}; using the PDF text fallback chain.",
+                        file=sys.stderr,
+                    )
                 extraction_mode = "text"
                 
         if extraction_mode == "text" or not text:
@@ -1309,6 +1409,7 @@ def extract_single_file(input_path: Path, extraction_mode: str, install_mode: st
         "filename": input_path.name,
         "format": document_format,
         "extraction_method": method,
+        "fallback_reason": fallback_reason,
         "file_size_mb": round(file_size_mb, 2),
         "sha256": file_sha256,
         pages_label: pages,
@@ -1471,6 +1572,28 @@ def main():
     # headings and make the result depend on the source-path length.
     structure_text = "\n\n".join(src["text"] for src in extracted_sources)
     consolidated_structure = detect_structure(structure_text)
+    structural_sources = [
+        src for src in extracted_sources
+        if src["chapters_method"] == "structural" and src["chapters_detected"] >= 2
+    ]
+    if (
+        len(extracted_sources) > 1
+        and structural_sources
+        and all(src["chapters_method"] != "numeric" for src in extracted_sources)
+    ):
+        # Each source has already selected its own chapter depth. Re-scanning
+        # the joined corpus selects the H1 source titles instead when there are
+        # multiple books with H2 chapters (issue #272). A lone heading in a
+        # source may only be its title, so it is not added to the chapter count.
+        consolidated_structure["chapters_detected"] = sum(
+            src["chapters_detected"] for src in structural_sources
+        )
+        consolidated_structure["chapter_headings_sample"] = [
+            heading
+            for src in structural_sources
+            for heading in src["chapter_headings_sample"]
+        ][:10]
+        consolidated_structure["chapters_method"] = "structural"
     # has_toc is a per-source property, so it has to be combined per source
     # rather than re-derived from the corpus. detect_structure only scans the
     # first ~30k chars, because a table of contents sits in a book's front
@@ -1506,6 +1629,7 @@ def main():
                 "filename": src["filename"],
                 "format": src["format"],
                 "extraction_method": src["extraction_method"],
+                "fallback_reason": src["fallback_reason"],
                 "file_size_mb": src["file_size_mb"],
                 "sha256": src["sha256"],
                 "pages": src["pages"],
@@ -1570,4 +1694,3 @@ def main():
             print(f"     - {path.name}: {err}")
     else:
         print_support_note()
-

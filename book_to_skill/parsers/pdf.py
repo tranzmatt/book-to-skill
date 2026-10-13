@@ -262,23 +262,20 @@ def extract_with_docling(
         from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.datamodel.base_models import InputFormat
         from docling.document_converter import PdfFormatOption
-
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = force_ocr
-        pipeline_options.do_table_structure = True
-
-        converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-            }
-        )
-        result = converter.convert(pdf_path)
-        text = result.document.export_to_markdown()
     except ImportError:
         return None
-    except Exception as e:
-        print(f"  [warn] extract_with_docling failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return None
+
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = force_ocr
+    pipeline_options.do_table_structure = True
+
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+        }
+    )
+    result = converter.convert(pdf_path)
+    text = result.document.export_to_markdown()
 
     if force_ocr or not _is_low_yield(text, pdf_path):
         return text
@@ -296,7 +293,15 @@ def extract_with_docling(
         ("tesseract", lambda: _ocr_via_tesseract(pdf_path)),
     )
     for tier_name, run in tiers:
-        candidate = run()
+        try:
+            candidate = run()
+        except Exception as exc:
+            print(
+                f"  [warn] {tier_name} OCR tier failed: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            continue
         if not candidate or not candidate.strip():
             continue
         if len(candidate.split()) > len((best_text or "").split()):

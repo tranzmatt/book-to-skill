@@ -715,6 +715,27 @@ class TestDetectStructure:
         assert _chapter_number("இந்த அத்தியாயத்தில் நாம் பார்ப்போம்") is None
         assert _chapter_number("அத்தியாயம்") is None
 
+    def test_detects_sinhala_chapters(self):
+        """Sinhala headings: `පරිච්ඡේදය N`, Arabic or Sinhala Lith digits."""
+        text = (
+            "පරිච්ඡේදය 1 හැඳින්වීම\nසාරාංශය\n"
+            "පරිච්ඡේදය ෨ ක්‍රම\nසාරාංශය\n"
+            "පරිච්ඡේදය 3 ප්‍රතිඵල\nසාරාංශය"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_sinhala_markdown_prefix(self):
+        text = "## පරිච්ඡේදය 1 පළමු\nසාරාංශය\n## පරිච්ඡේදය 2 දෙවන\nසාරාංශය"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_sinhala_prose_is_not_a_chapter_heading(self):
+        """Inflected forms (පරිච්ඡේදයේ / පරිච්ඡේදයක්) and the bare word are not headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("මෙම පරිච්ඡේදයේ අපි සාකච්ඡා කරමු") is None
+        assert _chapter_number("තවත් පරිච්ඡේදයක් ඇත") is None
+        assert _chapter_number("පරිච්ඡේදය") is None
+
     def test_detects_telugu_chapters(self):
         """Telugu headings: both spellings (అధ్యాయము/అధ్యాయం), Telugu or Arabic digits."""
         text = (
@@ -796,6 +817,37 @@ class TestDetectStructure:
         assert _chapter_number("આ અધ્યાયમાં આપણે ચર્ચા કરીશું") is None
         assert _chapter_number("પ્રકરણ") is None
         assert _chapter_number("અધ્યાય") is None
+
+    def test_detects_punjabi_chapters(self):
+        """Punjabi headings: both words (ਕਾਂਡ/ਅਧਿਆਇ), Gurmukhi or Arabic digits."""
+        text = (
+            "ਕਾਂਡ ੧ ਜਾਣ-ਪਛਾਣ\nਸਾਰ\n"
+            "ਅਧਿਆਇ ੨ ਢੰਗ\nਸਾਰ\n"
+            "ਕਾਂਡ 3 ਨਤੀਜੇ\nਸਾਰ"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_punjabi_markdown_prefix(self):
+        text = "## ਕਾਂਡ ੧ ਪਹਿਲਾ\nਸਾਰ\n## ਅਧਿਆਇ ੨ ਦੂਜਾ\nਸਾਰ"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_punjabi_prose_is_not_a_chapter_heading(self):
+        """A postposition phrase, an oblique form, or a bare word is not a heading."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ਇਸ ਕਾਂਡ ਵਿੱਚ ਅਸੀਂ ਚਰਚਾ ਕਰਾਂਗੇ") is None
+        assert _chapter_number("ਇਸ ਅਧਿਆਇ ਵਿੱਚ ਅਸੀਂ ਚਰਚਾ ਕਰਾਂਗੇ") is None
+        assert _chapter_number("ਸਾਰੇ ਕਾਂਡਾਂ ਦੀ ਸੂਚੀ") is None
+        assert _chapter_number("ਕਾਂਡ") is None
+        assert _chapter_number("ਅਧਿਆਇ") is None
+
+    def test_punjabi_does_not_collide_with_neighbouring_scripts(self):
+        """Gurmukhi (U+0A00–0A7F), Gujarati (U+0A80–0AFF) and Devanagari stay separate."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("ਅਧਿਆਇ ੫") == 5
+        assert _chapter_number("અધ્યાય ૫") == 5
+        assert _chapter_number("अध्याय ५") == 5
 
     def test_gujarati_adhyay_does_not_collide_with_hindi(self):
         """Gujarati અધ્યાય (U+0A85…) and Devanagari अध्याय (U+0905…) are distinct."""
@@ -922,6 +974,33 @@ class TestDetectStructure:
             assert _chapter_number(f"فصل {word}") == n, word
         # Common ZWNJ spelling of 30.
         assert _chapter_number("فصل سی‌ام") == 30
+
+    def test_persian_zwnj_ordinal_survives_sanitization(self):
+        """The ZWNJ spelling of 30 must still resolve after U+200C is stripped.
+
+        sanitize_extracted_text() removes U+200C (a prompt-injection spacer)
+        before detect_structure() runs, so asserting on the raw heading alone
+        passes while the real pipeline misses the chapter.
+        """
+        from book_to_skill.sanitize import sanitize_extracted_text
+        from book_to_skill.utils import _chapter_number
+
+        heading = "فصل سی‌ام"
+        sanitized, removed = sanitize_extracted_text(heading)
+        assert removed == 1
+        assert sanitized != heading
+        assert _chapter_number(sanitized) == 30
+
+    def test_persian_zwnj_chapter_detected_end_to_end(self):
+        """A ZWNJ-spelled Persian heading is counted after sanitization."""
+        from book_to_skill.sanitize import sanitize_extracted_text
+
+        text = (
+            "فصل بیستم مقدمه\nمتن\n"
+            "فصل سی‌ام نتیجه\nمتن"
+        )
+        sanitized, _ = sanitize_extracted_text(text)
+        assert detect_structure(sanitized)["chapters_detected"] == 2
 
     def test_persian_compound_word_numerals(self):
         """Explicit compound forms used in longer Persian books."""
@@ -2116,6 +2195,139 @@ class TestEpubSpineOrder:
         out = extract_with_zipfile(str(p))
         assert "AAA" in out and "BBB" in out
 
+
+def test_ebooklib_spine_order_without_optional_dependencies(monkeypatch):
+    """The preferred parser's spine logic runs in the dependency-free CI matrix."""
+    import types
+
+    from book_to_skill.parsers.epub import extract_with_ebooklib
+
+    item_document = 9
+
+    class FakeItem:
+        def __init__(self, item_id, content):
+            self.item_id = item_id
+            self.content = content
+
+        def get_type(self):
+            return item_document
+
+        def get_content(self):
+            return self.content
+
+    first = FakeItem("c1", "FIRST")
+    second = FakeItem("c2", "SECOND")
+    nav = FakeItem("nav", "NAVIGATION")
+
+    class FakeBook:
+        spine = [("c1", "yes"), ("c2", "yes")]
+
+        def __init__(self):
+            self.items = {item.item_id: item for item in (first, second, nav)}
+
+        def get_items_of_type(self, item_type):
+            assert item_type == item_document
+            # EPUB manifest order deliberately differs from the spine order.
+            return [second, first, nav]
+
+        def get_item_with_id(self, item_id):
+            return self.items.get(item_id)
+
+    book = FakeBook()
+
+    class FakeSoup:
+        def __init__(self, content, _parser):
+            self.content = content
+
+        def get_text(self, separator="\n"):
+            return self.content
+
+    ebooklib = types.ModuleType("ebooklib")
+    ebooklib.ITEM_DOCUMENT = item_document
+    epub = types.ModuleType("ebooklib.epub")
+    epub.read_epub = lambda _path: book
+    ebooklib.epub = epub
+    bs4 = types.ModuleType("bs4")
+    bs4.BeautifulSoup = FakeSoup
+    monkeypatch.setitem(sys.modules, "ebooklib", ebooklib)
+    monkeypatch.setitem(sys.modules, "ebooklib.epub", epub)
+    monkeypatch.setitem(sys.modules, "bs4", bs4)
+
+    text = extract_with_ebooklib("unused.epub")
+    assert text.index("FIRST") < text.index("SECOND") < text.index("NAVIGATION")
+
+    book.spine = [("c1", "yes"), ("missing", "yes"), ("c1", "yes")]
+    text_with_invalid_refs = extract_with_ebooklib("unused.epub")
+    assert text_with_invalid_refs.index("FIRST") < text_with_invalid_refs.index("SECOND")
+    assert text_with_invalid_refs.index("SECOND") < text_with_invalid_refs.index("NAVIGATION")
+    assert text_with_invalid_refs.count("FIRST") == 1
+
+
+class TestEbooklibEpubSpineOrder:
+    """The preferred EPUB extractor follows the OPF spine as well."""
+
+    def _make_book(self, epub, spine):
+        book = epub.EpubBook()
+        book.set_identifier("synthetic-spine-order")
+        book.set_title("Synthetic ordering fixture")
+        book.set_language("en")
+
+        first = epub.EpubHtml(title="Chapter 1", file_name="z-first.xhtml", uid="c1")
+        first.content = "<h1>Chapter 1</h1><p>FIRST: Define the calibration procedure.</p>"
+        second = epub.EpubHtml(title="Chapter 2", file_name="a-second.xhtml", uid="c2")
+        second.content = "<h1>Chapter 2</h1><p>SECOND: Apply the procedure defined earlier.</p>"
+        nav = epub.EpubNav(title="Navigation")
+        nav.content = "<html><body><p>NAVIGATION-MARKER</p></body></html>"
+
+        # This is also the valid fixture's manifest order. File names deliberately
+        # sort opposite to the reading order so archive/name order cannot pass.
+        book.add_item(second)
+        book.add_item(first)
+        book.add_item(nav)
+        book.spine = spine
+        book.toc = [first, second]
+        return book
+
+    def test_spine_order_overrides_manifest_order_and_nav_follows(self, tmp_path):
+        epub = pytest.importorskip("ebooklib.epub")
+        pytest.importorskip("bs4")
+        from book_to_skill.parsers.epub import extract_with_ebooklib
+
+        book = self._make_book(epub, [])
+        book.spine = [book.get_item_with_id("c1"), book.get_item_with_id("c2")]
+        epub_path = tmp_path / "spine-order.epub"
+        epub.write_epub(str(epub_path), book)
+
+        text = extract_with_ebooklib(str(epub_path))
+
+        assert text is not None
+        assert text.index("FIRST:") < text.index("SECOND:") < text.index("Navigation")
+
+    def test_missing_or_repeated_spine_refs_keep_documents_once(self, monkeypatch):
+        epub = pytest.importorskip("ebooklib.epub")
+        pytest.importorskip("bs4")
+        from book_to_skill.parsers.epub import extract_with_ebooklib
+
+        book = self._make_book(epub, [("c1", "yes"), ("missing", "yes"), ("c1", "yes")])
+        monkeypatch.setattr(epub, "read_epub", lambda _path: book)
+
+        text = extract_with_ebooklib("unused.epub")
+
+        assert text is not None
+        assert text.index("FIRST:") < text.index("SECOND:") < text.index("NAVIGATION-MARKER")
+        assert text.count("FIRST:") == 1
+        assert text.count("SECOND:") == 1
+        assert text.count("NAVIGATION-MARKER") == 1
+
+        book.spine = []
+        text_without_spine = extract_with_ebooklib("unused.epub")
+
+        assert text_without_spine is not None
+        assert text_without_spine.index("SECOND:") < text_without_spine.index("FIRST:")
+        assert text_without_spine.index("FIRST:") < text_without_spine.index("NAVIGATION-MARKER")
+        assert text_without_spine.count("FIRST:") == 1
+        assert text_without_spine.count("SECOND:") == 1
+        assert text_without_spine.count("NAVIGATION-MARKER") == 1
 
 class TestTextEncodingDetection:
     """read_text_file decodes UTF-16/UTF-32 by BOM, with a BOM-less fallback."""
