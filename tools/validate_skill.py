@@ -24,16 +24,12 @@ Refs:
              https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices
   Copilot    https://docs.github.com/en/copilot/concepts/agents/about-agent-skills
              https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills
-   Amp        https://ampcode.com/manual#skills
-   Hermes     https://hermes-agent.nousresearch.com/docs/user-guide/features/skills
-   OpenClaw   https://docs.openclaw.ai/tools/skills
-
-Usage: python3 tools/validate_skill.py [--lens claude|copilot|amp|hermes|openclaw] [path/to/SKILL.md]
   Amp        https://ampcode.com/manual#skills
-   Hermes     https://hermes-agent.nousresearch.com/docs/user-guide/features/skills
-   OpenCode   https://opencode.ai/docs/skills
+  Hermes     https://hermes-agent.nousresearch.com/docs/user-guide/features/skills
+  OpenClaw   https://docs.openclaw.ai/tools/skills
+  OpenCode   https://opencode.ai/docs/skills
 
-Usage: python3 tools/validate_skill.py [--lens claude|copilot|amp|hermes|opencode] [path/to/SKILL.md]
+Usage: python3 tools/validate_skill.py [--lens claude|copilot|amp|hermes|openclaw|opencode] [path/to/SKILL.md]
 """
 import argparse
 import re
@@ -160,9 +156,33 @@ def parse_frontmatter(text):
     return text[3:end].lstrip("\n"), text[end + 4:]
 
 
+_BLOCK_SCALAR = re.compile(r"^([|>])[+-]?[0-9]?[+-]?$")
+
+
 def get_scalar(fm, key):
-    m = re.search(rf"^{re.escape(key)}:\s*(.*)$", fm, re.MULTILINE)
-    return m.group(1).strip().strip('"').strip("'") if m else None
+    m = re.search(rf"^{re.escape(key)}:[ \t]*(.*)$", fm, re.MULTILINE)
+    if not m:
+        return None
+    value = m.group(1).strip()
+    block = _BLOCK_SCALAR.match(value)
+    if not block:
+        return value.strip('"').strip("'")
+    # Block scalar (`key: |` or `key: >`): the value is the indented lines that
+    # follow, not the indicator. Reading only the indicator made every block
+    # description look one character long, so the 1024-char cap never fired.
+    lines = []
+    for ln in fm[m.end():].splitlines()[1:]:
+        if ln.strip() and not ln[:1].isspace():
+            break
+        lines.append(ln)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    indent = min((len(ln) - len(ln.lstrip()) for ln in lines if ln.strip()), default=0)
+    lines = [ln[indent:] for ln in lines]
+    if block.group(1) == "|":
+        return "\n".join(lines)
+    # Folded (`>`): lines join with a space, blank lines become line breaks.
+    return "\n".join(" ".join(p.split("\n")) for p in "\n".join(lines).split("\n\n"))
 
 
 def get_list_items(fm, key):

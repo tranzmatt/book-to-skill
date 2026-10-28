@@ -163,6 +163,7 @@ def _result_from_inspector(
         "filename": input_path.name,
         "format": "pdf",
         "extraction_method": "pdf-inspector",
+        "fallback_reason": None,
         "file_size_mb": round(file_size_mb, 2),
         "sha256": file_sha256,
         "pages": pages,

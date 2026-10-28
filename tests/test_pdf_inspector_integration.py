@@ -181,9 +181,60 @@ def test_hook_uses_inspector_for_clean_text_pdf(tmp_path, monkeypatch):
     result = fake_utils.extract_single_file(pdf, "text", "no")
 
     assert result["extraction_method"] == "pdf-inspector"
+    assert result["fallback_reason"] is None
     assert result["pages"] == 12
     assert original_calls == []
     assert integration._INSPECTIONS[str(pdf.resolve())] == inspection
+
+
+def test_inspector_success_writes_metadata(tmp_path, monkeypatch):
+    from book_to_skill import utils
+
+    integration._reset_state_for_tests()
+    pdf = tmp_path / "book.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nsynthetic fixture")
+    output_dir = tmp_path / "output"
+    monkeypatch.setenv("BOOK_SKILL_WORKDIR", str(output_dir))
+    monkeypatch.setattr(utils, "OUTPUT_DIR", output_dir)
+    monkeypatch.setattr(utils, "OUTPUT_TEXT", output_dir / "full_text.txt")
+    monkeypatch.setattr(utils, "OUTPUT_META", output_dir / "metadata.json")
+    monkeypatch.setattr(utils, "prepare_dependencies", lambda *_args: None)
+    # Restore the real extractor after the hook has replaced it for this test.
+    monkeypatch.setattr(utils, "extract_single_file", utils.extract_single_file)
+    monkeypatch.setitem(
+        sys.modules, "pdf_inspector",
+        SimpleNamespace(process_pdf=lambda _path: _fake_result()),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["extract.py", str(pdf), "--mode", "text", "--install-missing", "no"]
+    )
+
+    integration.install_pdf_inspector_hook(utils)
+    utils.main()
+
+    metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["total_sources"] == 1
+    assert len(metadata["sources"]) == 1
+    source = metadata["sources"][0]
+    assert source["source_file"] == str(pdf.resolve())
+    assert source["extraction_method"] == "pdf-inspector"
+    assert source["fallback_reason"] is None
+    assert source["pages"] == 12
+    assert "Useful text" in (output_dir / "full_text.txt").read_text(encoding="utf-8")
+
+
+def test_hook_uses_existing_pipeline_without_inspector(tmp_path, monkeypatch):
+    integration._reset_state_for_tests()
+    pdf = tmp_path / "book.pdf"
+    pdf.write_bytes(b"%PDF-1.7\nsynthetic fixture")
+    monkeypatch.setitem(sys.modules, "pdf_inspector", None)
+    legacy = {"extraction_method": "legacy", "fallback_reason": "docling_unavailable"}
+    fake_utils = SimpleNamespace(extract_single_file=lambda *_args: legacy)
+
+    integration.install_pdf_inspector_hook(fake_utils)
+
+    assert fake_utils.extract_single_file(pdf, "text", "no") is legacy
+    assert integration._INSPECTIONS == {}
 
 
 def test_hook_translates_post_extraction_stat_failure(tmp_path, monkeypatch):

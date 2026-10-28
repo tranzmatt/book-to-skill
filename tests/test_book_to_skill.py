@@ -897,6 +897,36 @@ class TestDetectStructure:
         assert _chapter_number("Σε αυτό το κεφάλαιο θα δούμε") is None
         assert _chapter_number("Κεφάλαιο") is None
 
+    def test_detects_hebrew_chapters(self):
+        """Hebrew headings: `פרק N`, with Arabic digits."""
+        text = (
+            "פרק 1 מבוא\nתקציר\n"
+            "פרק 2 שיטות\nתקציר\n"
+            "פרק 3 תוצאות\nתקציר"
+        )
+        assert detect_structure(text)["chapters_detected"] == 3
+
+    def test_hebrew_markdown_prefix(self):
+        text = "## פרק 1 ראשון\nתקציר\n## פרק 2 שני\nתקציר"
+        assert detect_structure(text)["chapters_detected"] == 2
+
+    def test_hebrew_prose_is_not_a_chapter_heading(self):
+        """Plural/prefixed forms and the bare word are not headings."""
+        from book_to_skill.utils import _chapter_number
+
+        assert _chapter_number("בפרק זה נדון בנושא") is None
+        assert _chapter_number("פרקים רבים בספר") is None
+        assert _chapter_number("פרק") is None
+
+    def test_hebrew_heading_survives_bidi_controls(self):
+        """Bidi wrappers are stripped before detection, so the heading still counts."""
+        from book_to_skill.sanitize import sanitize_extracted_text
+
+        text = "\u202bפרק 1 מבוא\u202c\nתקציר\n\u202bפרק 2 שיטות\u202c\nתקציר"
+        sanitized, removed = sanitize_extracted_text(text)
+        assert removed == 4
+        assert detect_structure(sanitized)["chapters_detected"] == 2
+
     # ── Korean chapter headings ────────────────────────────────────────────
 
     def test_korean_je_n_jang(self):
@@ -1967,7 +1997,6 @@ class TestDocxTableReconstruction:
     _NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
     def _make_docx(self, tmp_path, body_xml):
-        import zipfile
         p = tmp_path / "t.docx"
         doc = (
             '<?xml version="1.0"?>'
@@ -2043,6 +2072,127 @@ class TestDocxTableReconstruction:
         )
         out = extract_docx_with_zipfile(self._make_docx(tmp_path, body))
         assert out == "Before\nInside SDT\nAfter"
+
+    def test_dispatcher_uses_more_complete_output_for_sdt(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            self._para("Before")
+            + "<w:sdt><w:sdtContent>" + self._para("Inside SDT") + "</w:sdtContent></w:sdt>"
+            + self._para("After")
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value="Before\nAfter",
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert method == "zipfile-docx"
+        assert text == "Before\nInside SDT\nAfter"
+
+    def test_dispatcher_prefers_sdt_coverage_over_longer_output(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            self._para("Before")
+            + "<w:sdt><w:sdtContent>" + self._para("X") + "</w:sdtContent></w:sdt>"
+            + self._para("After")
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        preferred = "Before\n" + "long ordinary paragraph " * 20 + "\nAfter"
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value=preferred,
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert len(text) < len(preferred)
+        assert method == "zipfile-docx"
+        assert text == "Before\nX\nAfter"
+
+    def test_dispatcher_does_not_match_sdt_paragraph_inside_another_paragraph(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            self._para("Chapter 10")
+            + "<w:sdt><w:sdtContent>" + self._para("1") + "</w:sdtContent></w:sdt>"
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        preferred = "Chapter 10\n" + "long ordinary paragraph " * 20
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value=preferred,
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert len(text) < len(preferred)
+        assert method == "zipfile-docx"
+        assert text == "Chapter 10\n1"
+
+    def test_dispatcher_counts_repeated_sdt_paragraphs(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            "<w:sdt><w:sdtContent>"
+            + self._para("Repeated")
+            + self._para("Repeated")
+            + "</w:sdtContent></w:sdt>"
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        preferred = "Repeated\n" + "long ordinary paragraph " * 20
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value=preferred,
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert len(text) < len(preferred)
+        assert method == "zipfile-docx"
+        assert text == "Repeated\nRepeated"
+
+    def test_dispatcher_keeps_preferred_when_fallback_adds_no_sdt_coverage(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        body = (
+            self._para("ordinary paragraph " * 20)
+            + "<w:sdt><w:sdtContent>" + self._para("Inside SDT") + "</w:sdtContent></w:sdt>"
+        )
+        docx_path = self._make_docx(tmp_path, body)
+        preferred = "Inside SDT"
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value=preferred,
+        ):
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert len(docx_parser.extract_docx_with_zipfile(docx_path)) > len(preferred)
+        assert method == "python-docx"
+        assert text == preferred
+
+    def test_dispatcher_keeps_preferred_parser_without_sdt(self, tmp_path):
+        from book_to_skill.parsers import docx as docx_parser
+
+        docx_path = self._make_docx(tmp_path, self._para("Ordinary document"))
+        with mock.patch.object(
+            docx_parser,
+            "extract_docx_with_python_docx",
+            return_value="Preferred parser output",
+        ), mock.patch.object(
+            docx_parser,
+            "extract_docx_with_zipfile",
+            wraps=docx_parser.extract_docx_with_zipfile,
+        ) as fallback:
+            text, method = docx_parser.extract_docx(docx_path)
+
+        assert method == "python-docx"
+        assert text == "Preferred parser output"
+        fallback.assert_not_called()
 
 
 class TestEpubSpineOrder:

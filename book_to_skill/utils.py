@@ -342,6 +342,18 @@ _RU_CHAPTER = re.compile(r"^\s*(?:#{1,6}\s+)?глава\s+([0-9]+)\b", re.IGNORE
 # matching.
 _EL_CHAPTER = re.compile(r"^\s*(?:#{1,6}\s+)?κεφ[άα]λαιο\s+([0-9]+)\b", re.IGNORECASE)
 
+# Hebrew chapter headings: "פרק 1", "פרק 12", "## פרק 2".
+# פרק ("chapter") + a number. Hebrew is unicameral and uses ordinary Arabic
+# digits, so neither case folding nor a digit remap is needed. Being right-to-left
+# does not affect the pattern: the regex reads the logical order stored in the
+# file, which is פ-ר-ק then the number, and sanitize_extracted_text() removes any
+# bidi wrapper (RLM/RLE/PDF) before detect_structure() sees the line. Requiring
+# whitespace then a number keeps prose from matching — the word also means
+# "joint", and the prefixed and plural forms ("בפרק", "פרקים") are not followed by
+# a number. Gematria numbering ("פרק א"), common in religious texts, is a separate
+# letter-to-number mapping and is deliberately not handled here.
+_HE_CHAPTER = re.compile(r"^\s*(?:#{1,6}\s+)?פרק\s+([0-9]+)\b")
+
 # Korean chapter headings: "제1장 총칙", "## 제4장 근로시간과 휴식", "제6장의2 …".
 # 제 + Arabic numeral + a classifier (장 chapter / 편 part / 절 section / 관
 # subsection), with an optional "의N" branch suffix that Korean statutes use for
@@ -842,6 +854,9 @@ def _match_chapter_number(
     elm = _EL_CHAPTER.match(s)
     if elm:
         return int(elm.group(1))
+    hem = _HE_CHAPTER.match(s)
+    if hem:
+        return int(hem.group(1))
 
     km = _KO_CHAPTER.match(s)
     if km:
@@ -875,6 +890,7 @@ def _chapter_number(line: str, prev_line: str | None = None) -> int | None:
     Punjabi ("ਕਾਂਡ 1", "ਅਧਿਆਇ ੧", "## ਕਾਂਡ 2"),
     Russian ("Глава 1", "ГЛАВА 12", "## Глава 2"),
     Greek ("Κεφάλαιο 1", "ΚΕΦΑΛΑΙΟ 12", "## Κεφάλαιο 2"),
+    Hebrew ("פרק 1", "פרק 12", "## פרק 2"),
     Korean ("제1장 총칙", "## 제4장 근로시간과 휴식"), and
     Persian ("فصل ۱", "فصل اول", "فصل بیست و یکم", "بخش ۲: مفاهیم",
     "## فصل ۱: مقدمه", PDF-glued "فصل سی و چهارمخداحافظ…") heading styles — each

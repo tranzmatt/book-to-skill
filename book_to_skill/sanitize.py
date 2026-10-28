@@ -211,15 +211,18 @@ def is_invisible_codepoint(codepoint: int) -> bool:
     strips. When the two sets drift, the extractor lets a character through that
     the scanner then warns about — or worse, neither layer covers it.
     """
-    if codepoint in _INVISIBLE_CODEPOINTS or codepoint in _ANNOTATION_CODEPOINTS:
+    # The explicit set already includes the annotation and deprecated controls.
+    if codepoint in _INVISIBLE_CODEPOINTS:
         return True
-    if _DEPRECATED_FORMAT_RANGE[0] <= codepoint <= _DEPRECATED_FORMAT_RANGE[1]:
-        return True
-    if _TAG_BLOCK_START <= codepoint <= _TAG_BLOCK_END:
-        return True
-    if _MUSICAL_FORMAT_RANGE[0] <= codepoint <= _MUSICAL_FORMAT_RANGE[1]:
-        return True
-    return any(low <= codepoint <= high for low, high in _VARIATION_SELECTOR_RANGES)
+    # All remaining ranges start at or above the BMP variation selectors.
+    if codepoint < _VARIATION_SELECTOR_RANGES[0][0]:
+        return False
+    return (
+        _VARIATION_SELECTOR_RANGES[0][0] <= codepoint <= _VARIATION_SELECTOR_RANGES[0][1]
+        or _MUSICAL_FORMAT_RANGE[0] <= codepoint <= _MUSICAL_FORMAT_RANGE[1]
+        or _TAG_BLOCK_START <= codepoint <= _TAG_BLOCK_END
+        or _VARIATION_SELECTOR_RANGES[1][0] <= codepoint <= _VARIATION_SELECTOR_RANGES[1][1]
+    )
 
 
 def sanitize_extracted_text(text: str) -> tuple[str, int]:
@@ -229,13 +232,17 @@ def sanitize_extracted_text(text: str) -> tuple[str, int]:
     :func:`fold_cjk_radicals`) because they are corrupted characters rather than
     an attack, so they do not count toward the returned removal total.
     """
-    kept: list[str] = []
-    removed = 0
+    if text.isascii():
+        return text, 0
 
-    for character in fold_cjk_radicals(text):
-        if is_invisible_codepoint(ord(character)):
-            removed += 1
-            continue
-        kept.append(character)
+    # Replace only distinct characters that need changing, avoiding translation
+    # lookups for every visible character in multilingual text.
+    cleaned = text
+    for codepoint in map(ord, set(text)):
+        if is_invisible_codepoint(codepoint):
+            cleaned = cleaned.replace(chr(codepoint), "")
+        elif codepoint in _KANGXI_RADICAL_FOLD:
+            cleaned = cleaned.replace(chr(codepoint), _KANGXI_RADICAL_FOLD[codepoint])
 
-    return "".join(kept), removed
+    # Each Kangxi radical folds to one ideograph, so only deletion changes length.
+    return cleaned, len(text) - len(cleaned)
